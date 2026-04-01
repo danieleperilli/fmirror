@@ -1,0 +1,32 @@
+# OS
+.DS_Store
+
+# Local Codex and scaffold config
+.codex/
+project-config.json
+
+# Editors
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.*
+!.env.example
+config.json
+
+# Dependencies
+node_modules/
+vendor/
+
+# Build artifacts
+dist/
+build/
+coverage/
+.cache/
+
+# Runtime state
+_fmirrorignore/

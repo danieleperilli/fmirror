@@ -1,0 +1,47 @@
+# Special folders 
+# **/_fmirrorignore is already ignored by default
+**/_sandbox
+**/_logs
+
+# Modules
+**/node_modules
+**/jspm_packages
+**/dist
+
+# SCSS
+.sass-cache
+
+# Jekyll
+.jekyll-cache
+.jekyll-metadata
+**/_site
+
+# ESLint
+.eslintcache
+
+# Grunt intermediate storage (https://gruntjs.com/creating-plugins#storing-task-files)
+.grunt
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Azurite artifacts
+AzuriteConfig
+**/__blobstorage__
+**/__queuestorage__
+__azurite_db_blob__.json
+__azurite_db_blob_extent__.json
+__azurite_db_queue__.json
+__azurite_db_queue_extent__.json
+__azurite_db_table__.json
+__azurite_db_table_extent__.json
+
+# Electron release artifacts
+**/release/app/dist
+**/release/build
+**/out
+
+# Temporary files
+**/_tmp
+**/.tmp
