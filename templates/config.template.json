@@ -1,0 +1,15 @@
+{
+    "debounceMs": 400,
+    "fileDebounceMs": 1500,
+    "jobs": [
+        {
+            "name": "source-folder",
+            "source": "/absolute/path/to/source",
+            "destinations": [
+                "/absolute/path/to/destination"
+            ],
+            "deleteMissing": true,
+            "watchHidden": true
+        }
+    ]
+}

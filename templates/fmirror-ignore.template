@@ -1,5 +1,5 @@
 # Special folders 
-# **/_fmirrorignore is already ignored by default
+# **/.fmirror is already ignored by default
 **/_sandbox
 **/_logs
 
@@ -19,7 +19,7 @@
 # ESLint
 .eslintcache
 
-# Grunt intermediate storage (https://gruntjs.com/creating-plugins#storing-task-files)
+# Grunt intermediate storage
 .grunt
 
 # System files
@@ -45,3 +45,18 @@ __azurite_db_table_extent__.json
 # Temporary files
 **/_tmp
 **/.tmp
+
+# GIT 
+# Bootstrap copy - it can be rebuilt with:
+# git fetch --all --tags
+# git checkout -B main origin/main -f
+# git submodule sync --recursive
+# git submodule update --init --recursive
+**/.git/**
+!**/.git/
+!**/.git/HEAD
+!**/.git/config
+!**/.git/objects/
+!**/.git/refs/
+!**/.git/info/
+!**/.git/info/sparse-checkout

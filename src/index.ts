@@ -7,17 +7,20 @@
  */
 
 import chokidar from "chokidar";
+import type { FSWatcher } from "chokidar";
+import { execFile } from "node:child_process";
+import type { Stats } from "node:fs";
 import fs from "fs-extra";
 import path from "node:path";
 import os from "node:os";
+import { promisify } from "node:util";
 import ignore from "ignore";
-import type { CliCommandName, FileEventName, IAppConfig, ICliArguments, IIgnoreFile, IJobConfig, IJobRuntime, IPersistedQueueItem, IPersistedQueueState, IQueuedFileEvent, IRuntimeAnalysis, ISourceManifest } from "./interfaces";
+import type { CliCommandName, FileEventName, IAppConfig, ICliArguments, IDestinationAnalysis, IFileState, IIgnoreFile, IJobConfig, IJobRuntime, IPersistedQueueItem, IPersistedQueueState, IQueuedFileEvent, IRuntimeAnalysis } from "./interfaces";
 
 const DEFAULT_CONFIG_FILE_NAME = "fmirror.config.json";
-const IGNORE_FILE_NAME = ".fmirrorignore";
-const INTERNAL_IGNORE_DIRECTORY_NAME = "_fmirrorignore";
-const INTERNAL_APP_DIRECTORY_NAME = "fmirror";
-const ERROR_LOG_FILE_NAME = "sync-errors.log";
+const IGNORE_FILE_NAME = ".fmirror-ignore";
+const INTERNAL_APP_DIRECTORY_NAME = ".fmirror";
+const ERROR_LOG_FILE_NAME = "sync-error.log";
 const ANALYSIS_LOG_FILE_NAME = "source-analysis.log";
 const QUEUE_FILE_NAME = "queue.json";
 const DEFAULT_DEBOUNCE_MS = 400;
@@ -26,11 +29,67 @@ const MIN_RETRY_DELAY_MS = 250;
 const MAX_RETRY_DELAY_MS = 10000;
 const FILE_EVENT_BURST_WINDOW_MS = 1000;
 const FILE_EVENT_BURST_THRESHOLD = 20;
+const WATCHER_ERROR_LOG_WINDOW_MS = 30000;
+const WATCHER_LIMIT_ERROR_LOG_WINDOW_MS = 300000;
 const INSTALL_DIRECTORY_NAME = "fmirror";
 const INSTALL_EXECUTABLE_FILE_NAME = "fmirror";
 const INSTALL_BUNDLE_FILE_NAME = "fmirror.js";
+const INSTALL_CONFIG_FILE_NAME = "config.json";
+const LAUNCH_AGENT_DIRECTORY_NAME = "LaunchAgents";
+const LAUNCH_AGENT_LOG_FILE_NAME = "launchd.log";
+const LAUNCH_AGENT_ERROR_LOG_FILE_NAME = "launchd-error.log";
+const TEMPLATE_DIRECTORY_NAME = "templates";
+const CONFIG_TEMPLATE_FILE_NAME = "config.template.json";
+const IGNORE_TEMPLATE_FILE_NAME = "fmirror-ignore.template";
+const LAUNCH_AGENT_TEMPLATE_FILE_NAME = "launch-agent.template.plist";
 const PATH_EXPORT_BLOCK_START = "# >>> fmirror >>>";
 const PATH_EXPORT_BLOCK_END = "# <<< fmirror <<<";
+
+const execFileAsync = promisify(execFile);
+
+interface ISourceFileVisit {
+    absolutePath: string;
+    relativePath: string;
+    fileState: IFileState;
+}
+
+type SourceEntryType = "file" | "directory";
+
+interface IInstallArguments {
+    sourcePath: string;
+    destinationPath: string;
+}
+
+interface IInstallEnvironment {
+    bundlePath: string;
+    templateDirectoryPath: string;
+    nodeExecutablePath: string;
+    homeDirectoryPath: string;
+    platform: NodeJS.Platform;
+    shellProfilePath?: string;
+    launchdDomainTarget?: string;
+    executeCommand(command: string, argumentsList: string[], ignoreFailure?: boolean): Promise<void>;
+}
+
+interface IGlobalInstallPaths {
+    globalInstallDirectoryPath: string;
+    installedBundlePath: string;
+    installedExecutablePath: string;
+    installedTemplateDirectoryPath: string;
+}
+
+interface IInstallPaths extends IGlobalInstallPaths {
+    sourceFolderSlug: string;
+    internalAppDirectoryPath: string;
+    configPath: string;
+    ignorePath: string;
+    launchAgentLabel: string;
+    launchAgentFileName: string;
+    launchAgentPath: string;
+    launchAgentSymlinkPath: string;
+    launchAgentLogPath: string;
+    launchAgentErrorLogPath: string;
+}
 
 /**
  * Boots the application, loads the config, performs the initial sync, and starts all watchers.
@@ -40,6 +99,11 @@ async function main(argv: string[] = process.argv): Promise<void> {
 
     if (cliArguments.command === "install") {
         await installCli(argv);
+        return;
+    }
+
+    if (cliArguments.command === "setup") {
+        await setupCli(argv);
         return;
     }
 
@@ -59,13 +123,22 @@ async function main(argv: string[] = process.argv): Promise<void> {
         return;
     }
 
+    let activeWatcherCount = 0;
+
     for (const runtime of runtimes) {
-        await runInitialSync(runtime);
+        if (cliArguments.fastStart) {
+            log(`[${runtime.config.name}] Fast start enabled. Skipping initial sync.`);
+        } else {
+            await runInitialSync(runtime);
+        }
+
         await replayRecoveredQueue(runtime);
-        await startWatcher(runtime, fullSyncDebounceMs);
+        if (await startWatcher(runtime, fullSyncDebounceMs)) {
+            activeWatcherCount += 1;
+        }
     }
 
-    log(`Watching ${runtimes.length} job(s). Press Ctrl+C to stop.`);
+    log(`Watching ${activeWatcherCount} of ${runtimes.length} job(s). Press Ctrl+C to stop.`);
 }
 
 /**
@@ -74,19 +147,28 @@ async function main(argv: string[] = process.argv): Promise<void> {
  * @param argv Raw process arguments.
  */
 function parseCliArguments(argv: string[] = process.argv): ICliArguments {
-    const firstArgument = argv[2];
-    const normalizedCommand = normalizeCliCommandName(firstArgument);
+    const rawArguments = argv.slice(2);
+    const normalizedCommand = normalizeCliCommandName(rawArguments[0]);
+    const command = normalizedCommand ?? "watch";
+    const remainingArguments = normalizedCommand ? rawArguments.slice(1) : rawArguments;
+    let configPath: string | undefined;
+    let fastStart = false;
 
-    if (!normalizedCommand) {
-        return {
-            command: "watch",
-            configPath: firstArgument
-        };
+    for (const argument of remainingArguments) {
+        if (isFastStartFlag(argument)) {
+            fastStart = true;
+            continue;
+        }
+
+        if (!configPath) {
+            configPath = argument;
+        }
     }
 
     return {
-        command: normalizedCommand,
-        configPath: argv[3]
+        command,
+        configPath,
+        fastStart
     };
 }
 
@@ -112,7 +194,20 @@ function normalizeCliCommandName(value: string | undefined): CliCommandName | un
         return "install";
     }
 
+    if (value === "setup") {
+        return "setup";
+    }
+
     return undefined;
+}
+
+/**
+ * Checks whether a CLI token enables fast start mode, which skips the initial full reconciliation.
+ *
+ * @param value CLI token to inspect.
+ */
+function isFastStartFlag(value: string | undefined): boolean {
+    return value === "-fast-start" || value === "--fast-start";
 }
 
 /**
@@ -216,8 +311,7 @@ function validateJobConfig(value: unknown, index: number, configDirectory: strin
     }
 
     const destinations = value.destinations.map((destinationValue, destinationIndex) => {
-        const destinationPath = readNonEmptyString(destinationValue, `${fieldPrefix}.destinations[${destinationIndex}]`);
-        return resolveConfiguredPath(destinationPath, configDirectory);
+        return validateDestinationConfig(destinationValue, `${fieldPrefix}.destinations[${destinationIndex}]`, configDirectory);
     });
 
     if (new Set(destinations).size !== destinations.length) {
@@ -231,6 +325,17 @@ function validateJobConfig(value: unknown, index: number, configDirectory: strin
         deleteMissing,
         watchHidden
     };
+}
+
+/**
+ * Validates and normalizes a single destination path.
+ *
+ * @param value Parsed destination path.
+ * @param fieldName Fully qualified destination field name.
+ * @param configDirectory Absolute directory that contains the config file.
+ */
+function validateDestinationConfig(value: unknown, fieldName: string, configDirectory: string): string {
+    return resolveConfiguredPath(readNonEmptyString(value, fieldName), configDirectory);
 }
 
 /**
@@ -262,10 +367,10 @@ function assertNoPathOverlaps(jobs: IJobConfig[]): void {
             label: "source",
             absolutePath: normalizeComparablePath(job.source)
         },
-        ...job.destinations.map((destinationPath, destinationIndex) => ({
+        ...job.destinations.map((destinationConfig, destinationIndex) => ({
             jobName: job.name,
             label: `destination[${destinationIndex}]`,
-            absolutePath: normalizeComparablePath(destinationPath)
+            absolutePath: normalizeComparablePath(destinationConfig)
         }))
     ]);
 
@@ -327,9 +432,8 @@ function isSameOrDescendantPath(parentPath: string, childPath: string): boolean 
  */
 async function createRuntime(job: IJobConfig, fileEventDebounceMs: number): Promise<IJobRuntime> {
     const source = path.resolve(job.source);
-    const destinations = job.destinations.map((destination) => path.resolve(destination));
-    const internalIgnoreDirectory = path.join(source, INTERNAL_IGNORE_DIRECTORY_NAME);
-    const internalAppDirectory = path.join(internalIgnoreDirectory, INTERNAL_APP_DIRECTORY_NAME);
+    const destinations = job.destinations.map((destinationConfig) => path.resolve(destinationConfig));
+    const internalAppDirectory = path.join(source, INTERNAL_APP_DIRECTORY_NAME);
     const errorLogPath = path.join(internalAppDirectory, ERROR_LOG_FILE_NAME);
     const queueFilePath = path.join(internalAppDirectory, QUEUE_FILE_NAME);
 
@@ -362,7 +466,6 @@ async function createRuntime(job: IJobConfig, fileEventDebounceMs: number): Prom
             watchHidden: job.watchHidden ?? true
         },
         ignoreFiles: [],
-        internalIgnoreDirectory,
         internalAppDirectory,
         errorLogPath,
         queueFilePath,
@@ -444,8 +547,9 @@ async function collectIgnoreFiles(runtime: IJobRuntime, currentDirectory: string
  *
  * @param runtime Runtime state for the current job.
  * @param absolutePath Absolute path to evaluate.
+ * @param isDirectory Whether the path should be evaluated as a directory candidate.
  */
-function isIgnored(runtime: IJobRuntime, absolutePath: string): boolean {
+function isIgnored(runtime: IJobRuntime, absolutePath: string, isDirectory: boolean = false): boolean {
     const normalizedPath = path.resolve(absolutePath);
 
     if (normalizedPath === runtime.config.source) {
@@ -474,7 +578,7 @@ function isIgnored(runtime: IJobRuntime, absolutePath: string): boolean {
             continue;
         }
 
-        const result = testIgnoreMatcher(ignoreFile.matcher, candidate);
+        const result = testIgnoreMatcher(ignoreFile.matcher, candidate, isDirectory);
         if (result.unignored) {
             ignored = false;
             continue;
@@ -507,15 +611,16 @@ async function runFullSync(runtime: IJobRuntime, label: string): Promise<void> {
     log(`[${runtime.config.name}] ${label} started.`);
 
     try {
-        const sourceManifest = await buildSourceManifest(runtime);
+        await visitSourceDirectories(runtime, runtime.config.source, async (absoluteDirectoryPath) => {
+            await syncDirectory(runtime, absoluteDirectoryPath);
+        });
 
-        for (const relativeFilePath of Array.from(sourceManifest.files).sort()) {
-            const absoluteFilePath = resolveRelativePath(runtime.config.source, relativeFilePath);
-            await syncFile(runtime, absoluteFilePath);
-        }
+        await visitSourceFiles(runtime, runtime.config.source, async (sourceFile) => {
+            await syncFile(runtime, sourceFile.absolutePath, sourceFile.fileState);
+        });
 
         if (runtime.config.deleteMissing) {
-            await pruneDestinations(runtime, sourceManifest);
+            await pruneDestinations(runtime);
         }
     } catch (error) {
         await appendOperationalErrorLog(runtime, label.toLowerCase(), runtime.config.source, error);
@@ -567,56 +672,18 @@ async function analyzeRuntime(runtime: IJobRuntime): Promise<IRuntimeAnalysis> {
     const analysis: IRuntimeAnalysis = {
         fileCount: 0,
         totalSizeBytes: 0,
-        logPath: path.join(runtime.internalAppDirectory, ANALYSIS_LOG_FILE_NAME)
+        logPath: path.join(runtime.internalAppDirectory, ANALYSIS_LOG_FILE_NAME),
+        destinationAnalyses: runtime.config.destinations.map(createEmptyDestinationAnalysis)
     };
 
-    await collectRuntimeAnalysis(runtime, runtime.config.source, analysis);
+    await visitSourceFiles(runtime, runtime.config.source, async (sourceFile) => {
+        analysis.fileCount += 1;
+        analysis.totalSizeBytes += sourceFile.fileState.size;
+        await updateDestinationAnalysesForSourceFile(runtime, analysis.destinationAnalyses, sourceFile);
+    });
+    await finalizeDestinationAnalyses(runtime, analysis.destinationAnalyses);
     await writeRuntimeAnalysisLog(runtime, analysis);
     return analysis;
-}
-
-/**
- * Recursively collects included file count and total size for a runtime.
- *
- * @param runtime Runtime to analyze.
- * @param currentDirectory Absolute directory currently being scanned.
- * @param analysis Mutable analysis summary.
- */
-async function collectRuntimeAnalysis(runtime: IJobRuntime, currentDirectory: string, analysis: IRuntimeAnalysis): Promise<void> {
-    const entries = await fs.readdir(currentDirectory, { withFileTypes: true });
-
-    for (const entry of entries) {
-        const absoluteEntryPath = path.join(currentDirectory, entry.name);
-
-        if (entry.name === IGNORE_FILE_NAME || isOperationalPath(runtime.config.source, absoluteEntryPath)) {
-            continue;
-        }
-
-        if (!runtime.config.watchHidden && isHiddenName(entry.name)) {
-            continue;
-        }
-
-        if (entry.isDirectory()) {
-            if (isIgnored(runtime, absoluteEntryPath)) {
-                continue;
-            }
-
-            await collectRuntimeAnalysis(runtime, absoluteEntryPath, analysis);
-            continue;
-        }
-
-        if (isIgnored(runtime, absoluteEntryPath)) {
-            continue;
-        }
-
-        const entryStats = await fs.stat(absoluteEntryPath);
-        if (!entryStats.isFile()) {
-            continue;
-        }
-
-        analysis.fileCount += 1;
-        analysis.totalSizeBytes += entryStats.size;
-    }
 }
 
 /**
@@ -636,39 +703,341 @@ async function writeRuntimeAnalysisLog(runtime: IJobRuntime, analysis: IRuntimeA
         `Total size human: ${formatBytes(analysis.totalSizeBytes)}`
     ];
 
+    for (const destinationAnalysis of analysis.destinationAnalyses) {
+        reportLines.push(
+            "",
+            `Destination: ${destinationAnalysis.path}`,
+            `Tracked files: ${destinationAnalysis.fileCount}`,
+            `Tracked size bytes: ${destinationAnalysis.totalSizeBytes}`,
+            `Tracked size human: ${formatBytes(destinationAnalysis.totalSizeBytes)}`,
+            `Missing files: ${destinationAnalysis.missingFileCount}`,
+            `Outdated files: ${destinationAnalysis.outdatedFileCount}`,
+            `Extra files: ${destinationAnalysis.extraFileCount}`
+        );
+    }
+
     await ensureOperationalStateDirectory(runtime);
     await fs.writeFile(analysis.logPath, `${reportLines.join("\n")}\n`, "utf8");
 }
 
 /**
- * Installs the built bundle into `~/fmirror` and adds that directory to the user's shell PATH.
+ * Installs or refreshes the globally available CLI in the user's home directory.
  *
  * @param argv Raw process arguments.
  */
 async function installCli(argv: string[] = process.argv): Promise<void> {
-    const installDirectoryPath = path.join(os.homedir(), INSTALL_DIRECTORY_NAME);
-    const sourceBundlePath = await resolveInstallSourceBundlePath(argv);
-    const installedBundlePath = path.join(installDirectoryPath, INSTALL_BUNDLE_FILE_NAME);
-    const installedExecutablePath = path.join(installDirectoryPath, INSTALL_EXECUTABLE_FILE_NAME);
-    const profilePath = await resolveShellProfilePath();
+    const installEnvironment = await createInstallEnvironment(argv);
+    const globalInstallPaths = createGlobalInstallPaths(installEnvironment.homeDirectoryPath);
+    await installGlobalCli(installEnvironment, globalInstallPaths);
 
-    await fs.ensureDir(installDirectoryPath);
-    if (path.resolve(sourceBundlePath) !== path.resolve(installedBundlePath)) {
-        await fs.copyFile(sourceBundlePath, installedBundlePath);
-    }
-    await fs.writeFile(installedExecutablePath, createInstalledLauncherContent(), "utf8");
-    await fs.chmod(installedExecutablePath, 0o755);
-    await ensurePathExport(profilePath, installDirectoryPath);
-
-    log(`Installed fmirror to ${installDirectoryPath}. Reload your shell or run: source ${profilePath}`);
+    log(`Installed global CLI to ${globalInstallPaths.globalInstallDirectoryPath}.`);
 }
 
 /**
- * Resolves the bundle that should be copied during installation.
+ * Creates the files required to mirror a source folder into a destination folder.
  *
  * @param argv Raw process arguments.
  */
-async function resolveInstallSourceBundlePath(argv: string[] = process.argv): Promise<string> {
+async function setupCli(argv: string[] = process.argv): Promise<void> {
+    const setupArguments = parseSetupArguments(argv);
+    const installEnvironment = await createInstallEnvironment(argv);
+    const setupPaths = createInstallPaths(setupArguments, installEnvironment.homeDirectoryPath);
+    await ensureGlobalCliInstalled(setupPaths);
+
+    const installPaths = await setupMirror(setupArguments, installEnvironment);
+
+    log(`Setup completed for ${setupArguments.sourcePath}. Config: ${installPaths.configPath}`);
+    if (installEnvironment.platform === "darwin") {
+        log(`launchd automation installed: ${installPaths.launchAgentPath}`);
+    } else {
+        log("launchd automation skipped because the current platform is not macOS.");
+    }
+}
+
+/**
+ * Parses the `setup` command arguments.
+ *
+ * @param argv Raw process arguments.
+ */
+function parseSetupArguments(argv: string[] = process.argv): IInstallArguments {
+    const rawArguments = argv.slice(2);
+    if (normalizeCliCommandName(rawArguments[0]) !== "setup") {
+        throw new Error("Setup arguments can only be parsed for the setup command.");
+    }
+
+    let sourcePath: string | undefined;
+    let destinationPath: string | undefined;
+
+    for (let argumentIndex = 1; argumentIndex < rawArguments.length; argumentIndex += 1) {
+        const argument = rawArguments[argumentIndex];
+
+        if (argument === "-s" || argument === "--source") {
+            sourcePath = readInstallOptionValue(rawArguments, argumentIndex, argument);
+            argumentIndex += 1;
+            continue;
+        }
+
+        if (argument === "-d" || argument === "--destination") {
+            destinationPath = readInstallOptionValue(rawArguments, argumentIndex, argument);
+            argumentIndex += 1;
+            continue;
+        }
+
+        throw new Error(`Unknown setup argument: ${argument}. Usage: fmirror setup -s <source-path> -d <destination-path>`);
+    }
+
+    if (!sourcePath || !destinationPath) {
+        throw new Error("Setup requires both -s <source-path> and -d <destination-path>.");
+    }
+
+    return {
+        sourcePath: resolveCliInputPath(sourcePath),
+        destinationPath: resolveCliInputPath(destinationPath)
+    };
+}
+
+/**
+ * Reads the value associated with a setup option flag.
+ *
+ * @param rawArguments Raw CLI arguments after the executable path.
+ * @param optionIndex Index of the option flag inside `rawArguments`.
+ * @param optionName Option currently being processed.
+ */
+function readInstallOptionValue(rawArguments: string[], optionIndex: number, optionName: string): string {
+    const optionValue = rawArguments[optionIndex + 1];
+    if (!optionValue || optionValue.startsWith("-")) {
+        throw new Error(`Missing value for ${optionName}. Usage: fmirror setup -s <source-path> -d <destination-path>`);
+    }
+
+    return optionValue;
+}
+
+/**
+ * Resolves a CLI path argument using the current working directory as its base.
+ *
+ * @param inputPath Raw CLI path value.
+ */
+function resolveCliInputPath(inputPath: string): string {
+    return resolveConfiguredPath(inputPath, process.cwd());
+}
+
+/**
+ * Resolves the runtime environment required by the install command.
+ *
+ * @param argv Raw process arguments.
+ */
+async function createInstallEnvironment(argv: string[] = process.argv): Promise<IInstallEnvironment> {
+    const platform = process.platform;
+
+    return {
+        bundlePath: await resolveInstallBundlePath(argv),
+        templateDirectoryPath: await resolveTemplateDirectoryPath(argv),
+        nodeExecutablePath: process.execPath,
+        homeDirectoryPath: os.homedir(),
+        platform,
+        shellProfilePath: await resolveShellProfilePath(platform),
+        launchdDomainTarget: platform === "darwin" ? resolveLaunchdDomainTarget() : undefined,
+        executeCommand: runCommand
+    };
+}
+
+/**
+ * Creates or refreshes the setup-managed files for a single source/destination pair.
+ *
+ * @param installArguments Parsed setup arguments.
+ * @param installEnvironment Runtime environment used by the install flow.
+ */
+async function setupMirror(installArguments: IInstallArguments, installEnvironment: IInstallEnvironment): Promise<IInstallPaths> {
+    await validateInstallArguments(installArguments);
+
+    const installPaths = createInstallPaths(installArguments, installEnvironment.homeDirectoryPath);
+    const configTemplateContent = await readTemplateContent(installEnvironment.templateDirectoryPath, CONFIG_TEMPLATE_FILE_NAME);
+    const ignoreTemplateContent = await readTemplateContent(installEnvironment.templateDirectoryPath, IGNORE_TEMPLATE_FILE_NAME);
+
+    await fs.ensureDir(installPaths.internalAppDirectoryPath);
+    await fs.ensureFile(installPaths.launchAgentLogPath);
+    await fs.ensureFile(installPaths.launchAgentErrorLogPath);
+
+    const configContent = await renderInstallConfigContent(configTemplateContent, installArguments, installPaths.configPath);
+    await fs.writeFile(installPaths.configPath, configContent, "utf8");
+    await ensureDefaultIgnoreFile(installPaths.ignorePath, ignoreTemplateContent);
+
+    if (installEnvironment.platform !== "darwin") {
+        return installPaths;
+    }
+
+    if (!installEnvironment.launchdDomainTarget) {
+        throw new Error("The current macOS session does not expose a launchd user domain.");
+    }
+
+    const launchAgentTemplateContent = await readTemplateContent(installEnvironment.templateDirectoryPath, LAUNCH_AGENT_TEMPLATE_FILE_NAME);
+    const launchAgentContent = renderLaunchAgentTemplate(launchAgentTemplateContent, {
+        label: installPaths.launchAgentLabel,
+        workingDirectoryPath: installArguments.sourcePath,
+        nodeExecutablePath: installEnvironment.nodeExecutablePath,
+        bundlePath: installPaths.installedBundlePath,
+        configPath: installPaths.configPath,
+        standardOutPath: installPaths.launchAgentLogPath,
+        standardErrorPath: installPaths.launchAgentErrorLogPath
+    });
+
+    await fs.ensureDir(path.dirname(installPaths.launchAgentPath));
+    await fs.writeFile(installPaths.launchAgentPath, launchAgentContent, "utf8");
+    await installLaunchAgent(installEnvironment, installPaths);
+    await ensureManagedSymlink(installPaths.launchAgentSymlinkPath, installPaths.launchAgentPath);
+
+    return installPaths;
+}
+
+/**
+ * Validates the install source and destination paths before writing files.
+ *
+ * @param installArguments Parsed install arguments.
+ */
+async function validateInstallArguments(installArguments: IInstallArguments): Promise<void> {
+    const sourceStats = await readExistingPathStats(installArguments.sourcePath);
+    if (!sourceStats) {
+        throw new Error(`Source folder does not exist: ${installArguments.sourcePath}`);
+    }
+
+    if (!sourceStats.isDirectory()) {
+        throw new Error(`Source path must be a directory: ${installArguments.sourcePath}`);
+    }
+
+    const destinationStats = await readExistingPathStats(installArguments.destinationPath);
+    if (destinationStats && !destinationStats.isDirectory()) {
+        throw new Error(`Destination path must be a directory when it already exists: ${installArguments.destinationPath}`);
+    }
+
+    const normalizedSourcePath = normalizeComparablePath(installArguments.sourcePath);
+    const normalizedDestinationPath = normalizeComparablePath(installArguments.destinationPath);
+    if (pathsOverlap(normalizedSourcePath, normalizedDestinationPath)) {
+        throw new Error(`Source and destination paths must not overlap: ${installArguments.sourcePath} <-> ${installArguments.destinationPath}`);
+    }
+}
+
+/**
+ * Creates the derived file-system paths used by the install command.
+ *
+ * @param installArguments Parsed install arguments.
+ * @param homeDirectoryPath Current user home directory.
+ */
+function createInstallPaths(installArguments: IInstallArguments, homeDirectoryPath: string): IInstallPaths {
+    const sourceFolderSlug = createSourceFolderSlug(installArguments.sourcePath);
+    const globalInstallPaths = createGlobalInstallPaths(homeDirectoryPath);
+    const internalAppDirectoryPath = path.join(installArguments.sourcePath, INTERNAL_APP_DIRECTORY_NAME);
+    const configPath = path.join(internalAppDirectoryPath, INSTALL_CONFIG_FILE_NAME);
+    const ignorePath = path.join(installArguments.sourcePath, IGNORE_FILE_NAME);
+    const launchAgentFileName = `com.fmirror-${sourceFolderSlug}.plist`;
+    const launchAgentPath = path.join(homeDirectoryPath, "Library", LAUNCH_AGENT_DIRECTORY_NAME, launchAgentFileName);
+    const launchAgentSymlinkPath = path.join(internalAppDirectoryPath, launchAgentFileName);
+
+    return {
+        ...globalInstallPaths,
+        sourceFolderSlug,
+        internalAppDirectoryPath,
+        configPath,
+        ignorePath,
+        launchAgentLabel: createLaunchAgentLabel(sourceFolderSlug),
+        launchAgentFileName,
+        launchAgentPath,
+        launchAgentSymlinkPath,
+        launchAgentLogPath: path.join(internalAppDirectoryPath, LAUNCH_AGENT_LOG_FILE_NAME),
+        launchAgentErrorLogPath: path.join(internalAppDirectoryPath, LAUNCH_AGENT_ERROR_LOG_FILE_NAME)
+    };
+}
+
+/**
+ * Creates the derived file-system paths used by the global CLI installation.
+ *
+ * @param homeDirectoryPath Current user home directory.
+ */
+function createGlobalInstallPaths(homeDirectoryPath: string): IGlobalInstallPaths {
+    const globalInstallDirectoryPath = path.join(homeDirectoryPath, INSTALL_DIRECTORY_NAME);
+
+    return {
+        globalInstallDirectoryPath,
+        installedBundlePath: path.join(globalInstallDirectoryPath, INSTALL_BUNDLE_FILE_NAME),
+        installedExecutablePath: path.join(globalInstallDirectoryPath, INSTALL_EXECUTABLE_FILE_NAME),
+        installedTemplateDirectoryPath: path.join(globalInstallDirectoryPath, TEMPLATE_DIRECTORY_NAME)
+    };
+}
+
+/**
+ * Creates a stable slug derived from the source folder name.
+ *
+ * @param sourcePath Absolute source path.
+ */
+function createSourceFolderSlug(sourcePath: string): string {
+    const sourceFolderName = path.basename(path.resolve(sourcePath)) || "source";
+    const slug = sourceFolderName
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+
+    return slug || "source";
+}
+
+/**
+ * Creates the launch agent label associated with an installed source folder.
+ *
+ * @param sourceFolderSlug Slug derived from the source folder name.
+ */
+function createLaunchAgentLabel(sourceFolderSlug: string): string {
+    return `com.fmirror.${sourceFolderSlug}`;
+}
+
+/**
+ * Installs or refreshes the globally available CLI used by interactive runs and launchd.
+ *
+ * @param installEnvironment Runtime environment used by the install flow.
+ * @param installPaths Derived install paths.
+ */
+async function installGlobalCli(installEnvironment: IInstallEnvironment, installPaths: IGlobalInstallPaths): Promise<void> {
+    await fs.ensureDir(installPaths.globalInstallDirectoryPath);
+
+    if (path.resolve(installEnvironment.bundlePath) !== path.resolve(installPaths.installedBundlePath)) {
+        await fs.copyFile(installEnvironment.bundlePath, installPaths.installedBundlePath);
+    }
+    if (path.resolve(installEnvironment.templateDirectoryPath) !== path.resolve(installPaths.installedTemplateDirectoryPath)) {
+        await fs.copy(installEnvironment.templateDirectoryPath, installPaths.installedTemplateDirectoryPath, {
+            overwrite: true,
+            errorOnExist: false
+        });
+    }
+
+    await fs.writeFile(installPaths.installedExecutablePath, createInstalledLauncherContent(), "utf8");
+    await fs.chmod(installPaths.installedExecutablePath, 0o755);
+
+    if (installEnvironment.shellProfilePath) {
+        await ensurePathExport(installEnvironment.shellProfilePath, installPaths.globalInstallDirectoryPath);
+    }
+}
+
+/**
+ * Ensures the global CLI files required by `setup` already exist.
+ *
+ * @param installPaths Derived paths used by the setup flow.
+ */
+async function ensureGlobalCliInstalled(installPaths: IGlobalInstallPaths): Promise<void> {
+    const hasInstalledBundle = await fs.pathExists(installPaths.installedBundlePath);
+    const hasInstalledExecutable = await fs.pathExists(installPaths.installedExecutablePath);
+    const hasInstalledTemplates = (await readExistingPathStats(installPaths.installedTemplateDirectoryPath))?.isDirectory() ?? false;
+
+    if (hasInstalledBundle && hasInstalledExecutable && hasInstalledTemplates) {
+        return;
+    }
+
+    throw new Error(`Global CLI is not installed. Run "fmirror install" first. Expected files under ${installPaths.globalInstallDirectoryPath}`);
+}
+
+/**
+ * Resolves the built bundle that should be copied into the global install directory.
+ *
+ * @param argv Raw process arguments.
+ */
+async function resolveInstallBundlePath(argv: string[] = process.argv): Promise<string> {
     const localDistBundlePath = path.resolve(process.cwd(), "dist", INSTALL_BUNDLE_FILE_NAME);
     if (await fs.pathExists(localDistBundlePath)) {
         return localDistBundlePath;
@@ -692,9 +1061,15 @@ async function resolveInstallSourceBundlePath(argv: string[] = process.argv): Pr
 }
 
 /**
- * Chooses the shell profile file that should receive the PATH export.
+ * Chooses the shell profile file that should receive the PATH export for the globally installed CLI.
+ *
+ * @param platform Current runtime platform.
  */
-async function resolveShellProfilePath(): Promise<string> {
+async function resolveShellProfilePath(platform: NodeJS.Platform): Promise<string | undefined> {
+    if (platform === "win32") {
+        return undefined;
+    }
+
     const shellName = path.basename(process.env.SHELL ?? "");
     const homeDirectoryPath = os.homedir();
 
@@ -715,7 +1090,7 @@ async function resolveShellProfilePath(): Promise<string> {
 }
 
 /**
- * Appends the install directory to the selected shell profile when the block is not already present.
+ * Appends the global install directory to the selected shell profile when the block is not already present.
  *
  * @param profilePath Shell profile to update.
  * @param installDirectoryPath Directory that should be added to PATH.
@@ -751,7 +1126,7 @@ function createPathExportBlock(installDirectoryPath: string): string {
 }
 
 /**
- * Creates the executable launcher script installed into `~/fmirror`.
+ * Creates the executable launcher script installed into the global CLI directory.
  */
 function createInstalledLauncherContent(): string {
     return [
@@ -766,144 +1141,597 @@ function createInstalledLauncherContent(): string {
 }
 
 /**
- * Builds a source manifest containing every mirrored file and directory.
+ * Resolves the directory that contains the install templates.
  *
- * @param runtime Runtime state for the current job.
+ * @param argv Raw process arguments.
  */
-async function buildSourceManifest(runtime: IJobRuntime): Promise<ISourceManifest> {
-    const manifest: ISourceManifest = {
-        files: new Set<string>(),
-        directories: new Set<string>()
-    };
+async function resolveTemplateDirectoryPath(argv: string[] = process.argv): Promise<string> {
+    const executablePath = argv[1] ? path.resolve(argv[1]) : undefined;
+    const candidateTemplateDirectories = new Set<string>([
+        path.resolve(process.cwd(), TEMPLATE_DIRECTORY_NAME)
+    ]);
 
-    await collectSourceManifest(runtime, runtime.config.source, manifest);
-    return manifest;
+    if (executablePath) {
+        candidateTemplateDirectories.add(path.resolve(path.dirname(executablePath), TEMPLATE_DIRECTORY_NAME));
+        candidateTemplateDirectories.add(path.resolve(path.dirname(executablePath), "..", TEMPLATE_DIRECTORY_NAME));
+    }
+
+    for (const candidateTemplateDirectory of candidateTemplateDirectories) {
+        const candidateStats = await readExistingPathStats(candidateTemplateDirectory);
+        if (candidateStats?.isDirectory()) {
+            return candidateTemplateDirectory;
+        }
+    }
+
+    throw new Error(`Template directory not found. Expected a ${TEMPLATE_DIRECTORY_NAME} folder near the current build output.`);
 }
 
 /**
- * Recursively collects mirrored source entries into a manifest.
+ * Reads a template file from disk.
  *
- * @param runtime Runtime state for the current job.
- * @param currentDirectory Absolute directory currently being scanned.
- * @param manifest Mutable source manifest.
+ * @param templateDirectoryPath Directory that contains the install templates.
+ * @param templateFileName Template file name to read.
  */
-async function collectSourceManifest(runtime: IJobRuntime, currentDirectory: string, manifest: ISourceManifest): Promise<void> {
-    const entries = await fs.readdir(currentDirectory, { withFileTypes: true });
+async function readTemplateContent(templateDirectoryPath: string, templateFileName: string): Promise<string> {
+    return fs.readFile(path.join(templateDirectoryPath, templateFileName), "utf8");
+}
 
-    for (const entry of entries) {
-        const absoluteEntryPath = path.join(currentDirectory, entry.name);
+/**
+ * Renders the install-managed config file, preserving selected user overrides when a config already exists.
+ *
+ * @param templateContent Raw config template content.
+ * @param installArguments Parsed install arguments.
+ * @param configPath Final config path written by the install flow.
+ */
+async function renderInstallConfigContent(templateContent: string, installArguments: IInstallArguments, configPath: string): Promise<string> {
+    const templateDefaults = readInstallTemplateDefaults(templateContent);
+    const existingConfig = await readExistingInstallConfig(configPath);
+    const existingJob = readFirstExistingConfigJob(existingConfig);
 
-        if (entry.name === IGNORE_FILE_NAME || isOperationalPath(runtime.config.source, absoluteEntryPath)) {
-            continue;
-        }
-
-        if (!runtime.config.watchHidden && isHiddenName(entry.name)) {
-            continue;
-        }
-
-        if (entry.isDirectory()) {
-            if (isIgnored(runtime, absoluteEntryPath)) {
-                continue;
+    const installConfig: IAppConfig = validateAppConfig({
+        debounceMs: isNonNegativeInteger(existingConfig?.debounceMs) ? existingConfig.debounceMs : templateDefaults.debounceMs,
+        fileDebounceMs: isNonNegativeInteger(existingConfig?.fileDebounceMs) ? existingConfig.fileDebounceMs : templateDefaults.fileDebounceMs,
+        jobs: [
+            {
+                name: readOptionalNonEmptyString(existingJob?.name) ?? createDefaultInstallJobName(installArguments.sourcePath),
+                source: installArguments.sourcePath,
+                destinations: [
+                    installArguments.destinationPath
+                ],
+                deleteMissing: typeof existingJob?.deleteMissing === "boolean" ? existingJob.deleteMissing : templateDefaults.deleteMissing,
+                watchHidden: typeof existingJob?.watchHidden === "boolean" ? existingJob.watchHidden : templateDefaults.watchHidden
             }
+        ]
+    }, path.dirname(configPath));
 
-            manifest.directories.add(getRelativePathFromSource(runtime.config.source, absoluteEntryPath));
-            await collectSourceManifest(runtime, absoluteEntryPath, manifest);
-            continue;
+    return `${JSON.stringify(installConfig, null, 4)}\n`;
+}
+
+/**
+ * Reads the numeric and boolean defaults from the config template.
+ *
+ * @param templateContent Raw config template content.
+ */
+function readInstallTemplateDefaults(templateContent: string): {
+    debounceMs: number;
+    fileDebounceMs: number;
+    deleteMissing: boolean;
+    watchHidden: boolean;
+} {
+    let parsedTemplate: unknown;
+
+    try {
+        parsedTemplate = JSON.parse(templateContent);
+    } catch (error) {
+        throw new Error(`Invalid config template JSON: ${formatError(error)}`);
+    }
+
+    if (!isPlainObject(parsedTemplate) || !Array.isArray(parsedTemplate.jobs) || parsedTemplate.jobs.length === 0 || !isPlainObject(parsedTemplate.jobs[0])) {
+        throw new Error("Config template must contain a non-empty jobs array.");
+    }
+
+    const templateJob = parsedTemplate.jobs[0];
+    return {
+        debounceMs: isNonNegativeInteger(parsedTemplate.debounceMs) ? parsedTemplate.debounceMs : DEFAULT_DEBOUNCE_MS,
+        fileDebounceMs: isNonNegativeInteger(parsedTemplate.fileDebounceMs) ? parsedTemplate.fileDebounceMs : DEFAULT_FILE_EVENT_DEBOUNCE_MS,
+        deleteMissing: typeof templateJob.deleteMissing === "boolean" ? templateJob.deleteMissing : true,
+        watchHidden: typeof templateJob.watchHidden === "boolean" ? templateJob.watchHidden : true
+    };
+}
+
+/**
+ * Reads an existing install-managed config file so selected values can be preserved across reruns.
+ *
+ * @param configPath Absolute config path managed by the install command.
+ */
+async function readExistingInstallConfig(configPath: string): Promise<Partial<IAppConfig> | undefined> {
+    if (!(await fs.pathExists(configPath))) {
+        return undefined;
+    }
+
+    let parsedConfig: unknown;
+
+    try {
+        parsedConfig = JSON.parse(await fs.readFile(configPath, "utf8"));
+    } catch (error) {
+        throw new Error(`Existing install config is not valid JSON: ${configPath}. ${formatError(error)}`);
+    }
+
+    if (!isPlainObject(parsedConfig)) {
+        throw new Error(`Existing install config must contain an object: ${configPath}`);
+    }
+
+    return parsedConfig as Partial<IAppConfig>;
+}
+
+/**
+ * Reads the first job from an existing config when it matches the expected object shape.
+ *
+ * @param existingConfig Existing install-managed config.
+ */
+function readFirstExistingConfigJob(existingConfig: Partial<IAppConfig> | undefined): Partial<IJobConfig> | undefined {
+    if (!existingConfig || !Array.isArray(existingConfig.jobs) || existingConfig.jobs.length === 0 || !isPlainObject(existingConfig.jobs[0])) {
+        return undefined;
+    }
+
+    return existingConfig.jobs[0] as Partial<IJobConfig>;
+}
+
+/**
+ * Builds the default job name stored in an install-managed config.
+ *
+ * @param sourcePath Absolute source path configured by install.
+ */
+function createDefaultInstallJobName(sourcePath: string): string {
+    return path.basename(path.resolve(sourcePath)) || "source";
+}
+
+/**
+ * Renders the macOS LaunchAgent plist from the provided template.
+ *
+ * @param templateContent Raw LaunchAgent template content.
+ * @param templateValues Placeholder values injected into the template.
+ */
+function renderLaunchAgentTemplate(templateContent: string, templateValues: {
+    label: string;
+    workingDirectoryPath: string;
+    nodeExecutablePath: string;
+    bundlePath: string;
+    configPath: string;
+    standardOutPath: string;
+    standardErrorPath: string;
+}): string {
+    return replaceTemplateTokens(templateContent, {
+        LABEL: escapeXml(templateValues.label),
+        WORKING_DIRECTORY: escapeXml(templateValues.workingDirectoryPath),
+        NODE_PATH: escapeXml(templateValues.nodeExecutablePath),
+        BUNDLE_PATH: escapeXml(templateValues.bundlePath),
+        CONFIG_PATH: escapeXml(templateValues.configPath),
+        STANDARD_OUT_PATH: escapeXml(templateValues.standardOutPath),
+        STANDARD_ERROR_PATH: escapeXml(templateValues.standardErrorPath)
+    });
+}
+
+/**
+ * Replaces `{{TOKEN}}` placeholders inside a template string.
+ *
+ * @param templateContent Raw template content.
+ * @param replacements Token replacements keyed by placeholder name.
+ */
+function replaceTemplateTokens(templateContent: string, replacements: Record<string, string>): string {
+    return templateContent.replace(/\{\{([A-Z_]+)\}\}/g, (_fullMatch, key: string) => replacements[key] ?? _fullMatch);
+}
+
+/**
+ * Escapes XML-special characters for values injected into the plist template.
+ *
+ * @param value Raw string value.
+ */
+function escapeXml(value: string): string {
+    return value
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
+}
+
+/**
+ * Ensures the default `.fmirror-ignore` file exists without overwriting a user-managed file.
+ *
+ * @param ignorePath Absolute ignore file path.
+ * @param templateContent Raw ignore template content.
+ */
+async function ensureDefaultIgnoreFile(ignorePath: string, templateContent: string): Promise<void> {
+    if (await fs.pathExists(ignorePath)) {
+        return;
+    }
+
+    const normalizedContent = templateContent.endsWith("\n") ? templateContent : `${templateContent}\n`;
+    await fs.writeFile(ignorePath, normalizedContent, "utf8");
+}
+
+/**
+ * Installs or reloads the launchd agent associated with an installed source folder.
+ *
+ * @param installEnvironment Runtime environment used by the install flow.
+ * @param installPaths Derived install paths.
+ */
+async function installLaunchAgent(installEnvironment: IInstallEnvironment, installPaths: IInstallPaths): Promise<void> {
+    if (!installEnvironment.launchdDomainTarget) {
+        throw new Error("Missing launchd domain target for macOS installation.");
+    }
+
+    await installEnvironment.executeCommand("launchctl", [
+        "bootout",
+        installEnvironment.launchdDomainTarget,
+        installPaths.launchAgentPath
+    ], true);
+
+    await installEnvironment.executeCommand("launchctl", [
+        "bootstrap",
+        installEnvironment.launchdDomainTarget,
+        installPaths.launchAgentPath
+    ]);
+}
+
+/**
+ * Creates or refreshes a symbolic link that points to the installed launch agent file.
+ *
+ * @param linkPath Absolute path of the managed symbolic link.
+ * @param targetPath Absolute path of the installed launch agent file.
+ */
+async function ensureManagedSymlink(linkPath: string, targetPath: string): Promise<void> {
+    try {
+        const linkStats = await fs.lstat(linkPath);
+        if (linkStats.isSymbolicLink()) {
+            const currentTargetPath = await fs.readlink(linkPath);
+            const resolvedTargetPath = path.resolve(path.dirname(linkPath), currentTargetPath);
+            if (resolvedTargetPath === path.resolve(targetPath)) {
+                return;
+            }
         }
 
-        if (isIgnored(runtime, absoluteEntryPath)) {
-            continue;
+        await fs.remove(linkPath);
+    } catch (error) {
+        if (!isMissingPathError(error)) {
+            throw error;
+        }
+    }
+
+    await fs.symlink(targetPath, linkPath);
+}
+
+/**
+ * Resolves the launchd domain used to register user agents on macOS.
+ */
+function resolveLaunchdDomainTarget(): string {
+    if (typeof process.getuid !== "function") {
+        throw new Error("Unable to resolve the current user id for launchd.");
+    }
+
+    return `gui/${process.getuid()}`;
+}
+
+/**
+ * Executes a child process without going through a shell.
+ *
+ * @param command Executable name.
+ * @param argumentsList Argument list passed to the executable.
+ * @param ignoreFailure When `true`, command failures are ignored.
+ */
+async function runCommand(command: string, argumentsList: string[], ignoreFailure = false): Promise<void> {
+    try {
+        await execFileAsync(command, argumentsList);
+    } catch (error) {
+        if (ignoreFailure) {
+            return;
         }
 
-        manifest.files.add(getRelativePathFromSource(runtime.config.source, absoluteEntryPath));
+        throw new Error(formatCommandError(command, argumentsList, error));
     }
 }
 
 /**
- * Removes stale files and directories from every destination so they match the source manifest.
+ * Formats a failed child-process execution into a readable error string.
+ *
+ * @param command Executable name.
+ * @param argumentsList Argument list passed to the executable.
+ * @param error Raw execution error.
+ */
+function formatCommandError(command: string, argumentsList: string[], error: unknown): string {
+    if (!error || typeof error !== "object") {
+        return `${command} ${argumentsList.join(" ")} failed: ${formatError(error)}`;
+    }
+
+    const candidate = error as {
+        stderr?: unknown;
+        stdout?: unknown;
+        message?: unknown;
+    };
+    const detail = readOptionalNonEmptyString(candidate.stderr) ?? readOptionalNonEmptyString(candidate.stdout) ?? readOptionalNonEmptyString(candidate.message) ?? formatError(error);
+    return `${command} ${argumentsList.join(" ")} failed: ${detail}`;
+}
+
+/**
+ * Recursively visits mirrored source directories without materializing the whole source tree in memory.
  *
  * @param runtime Runtime state for the current job.
- * @param sourceManifest Mirrored source state computed from the source tree.
+ * @param currentDirectory Absolute directory currently being scanned.
+ * @param visitor Async callback invoked for each mirrored source directory.
  */
-async function pruneDestinations(runtime: IJobRuntime, sourceManifest: ISourceManifest): Promise<void> {
+async function visitSourceDirectories(runtime: IJobRuntime, currentDirectory: string, visitor: (absoluteDirectoryPath: string) => Promise<void>): Promise<void> {
+    let entries: fs.Dirent[];
+
+    try {
+        entries = await fs.readdir(currentDirectory, { withFileTypes: true });
+    } catch (error) {
+        if (isMissingPathError(error)) {
+            return;
+        }
+
+        throw error;
+    }
+
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+
+    for (const entry of entries) {
+        if (!entry.isDirectory()) {
+            continue;
+        }
+
+        const absoluteEntryPath = path.join(currentDirectory, entry.name);
+        if (!shouldMirrorSourcePath(runtime, absoluteEntryPath, true)) {
+            continue;
+        }
+
+        await visitor(absoluteEntryPath);
+        await visitSourceDirectories(runtime, absoluteEntryPath, visitor);
+    }
+}
+
+/**
+ * Recursively visits mirrored source files without materializing the whole source tree in memory.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param currentDirectory Absolute directory currently being scanned.
+ * @param visitor Async callback invoked for each mirrored source file.
+ */
+async function visitSourceFiles(runtime: IJobRuntime, currentDirectory: string, visitor: (sourceFile: ISourceFileVisit) => Promise<void>): Promise<void> {
+    let entries: fs.Dirent[];
+
+    try {
+        entries = await fs.readdir(currentDirectory, { withFileTypes: true });
+    } catch (error) {
+        if (isMissingPathError(error)) {
+            return;
+        }
+
+        throw error;
+    }
+
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+
+    for (const entry of entries) {
+        const absoluteEntryPath = path.join(currentDirectory, entry.name);
+        if (!shouldMirrorSourcePath(runtime, absoluteEntryPath, false)) {
+            continue;
+        }
+
+        if (entry.isDirectory()) {
+            await visitSourceFiles(runtime, absoluteEntryPath, visitor);
+            continue;
+        }
+
+        const entryStats = await readExistingPathStats(absoluteEntryPath);
+        if (!entryStats || !entryStats.isFile()) {
+            continue;
+        }
+
+        await visitor({
+            absolutePath: absoluteEntryPath,
+            relativePath: getRelativePathFromSource(runtime.config.source, absoluteEntryPath),
+            fileState: toFileState(entryStats)
+        });
+    }
+}
+
+/**
+ * Creates the empty analysis accumulator for a destination before source and destination scans run.
+ *
+ * @param destination Destination path being analyzed.
+ */
+function createEmptyDestinationAnalysis(destination: string): IDestinationAnalysis {
+    return {
+        path: destination,
+        fileCount: 0,
+        totalSizeBytes: 0,
+        missingFileCount: 0,
+        outdatedFileCount: 0,
+        extraFileCount: 0
+    };
+}
+
+/**
+ * Updates destination analysis counters for one source file by checking the corresponding destination paths directly.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param destinationAnalyses Mutable destination analysis list.
+ * @param sourceFile Source file currently being analyzed.
+ */
+async function updateDestinationAnalysesForSourceFile(runtime: IJobRuntime, destinationAnalyses: IDestinationAnalysis[], sourceFile: ISourceFileVisit): Promise<void> {
+    for (const destinationAnalysis of destinationAnalyses) {
+        const destinationPath = resolveRelativePath(destinationAnalysis.path, sourceFile.relativePath);
+        const destinationStats = await readExistingPathStats(destinationPath);
+
+        if (!destinationStats || !destinationStats.isFile()) {
+            destinationAnalysis.missingFileCount += 1;
+            continue;
+        }
+
+        if (!areFileStatesEquivalent(sourceFile.fileState, toFileState(destinationStats))) {
+            destinationAnalysis.outdatedFileCount += 1;
+        }
+    }
+}
+
+/**
+ * Completes destination analysis counters by scanning each destination tree and classifying extra files.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param destinationAnalyses Mutable destination analysis list.
+ */
+async function finalizeDestinationAnalyses(runtime: IJobRuntime, destinationAnalyses: IDestinationAnalysis[]): Promise<void> {
+    for (const destinationAnalysis of destinationAnalyses) {
+        const destinationFileStates = await buildDestinationFileStateMap(destinationAnalysis.path);
+        destinationAnalysis.fileCount = destinationFileStates.size;
+        destinationAnalysis.totalSizeBytes = sumFileStateSize(destinationFileStates);
+
+        for (const relativePath of destinationFileStates.keys()) {
+            const sourceEntryType = await readMirrorableSourceEntryType(runtime, resolveRelativePath(runtime.config.source, relativePath));
+            if (sourceEntryType !== "file") {
+                destinationAnalysis.extraFileCount += 1;
+            }
+        }
+    }
+}
+
+/**
+ * Sums the total byte size tracked by a file state map.
+ *
+ * @param fileStates File state map to aggregate.
+ */
+function sumFileStateSize(fileStates: Map<string, IFileState>): number {
+    let totalSizeBytes = 0;
+
+    for (const fileState of fileStates.values()) {
+        totalSizeBytes += fileState.size;
+    }
+
+    return totalSizeBytes;
+}
+
+/**
+ * Builds a metadata map of the current destination tree using only file stats.
+ *
+ * @param destination Absolute destination root to inspect.
+ */
+async function buildDestinationFileStateMap(destination: string): Promise<Map<string, IFileState>> {
+    const fileStates = new Map<string, IFileState>();
+
+    if (!(await fs.pathExists(destination))) {
+        return fileStates;
+    }
+
+    await collectDestinationFileStates(destination, destination, fileStates);
+    return fileStates;
+}
+
+/**
+ * Recursively collects destination file metadata for comparison purposes.
+ *
+ * @param destinationRoot Absolute root directory of the destination.
+ * @param currentDirectory Absolute directory currently being scanned.
+ * @param fileStates Mutable map of destination file states.
+ */
+async function collectDestinationFileStates(destinationRoot: string, currentDirectory: string, fileStates: Map<string, IFileState>): Promise<void> {
+    let entries: fs.Dirent[];
+
+    try {
+        entries = await fs.readdir(currentDirectory, { withFileTypes: true });
+    } catch (error) {
+        if (isMissingPathError(error)) {
+            return;
+        }
+
+        throw error;
+    }
+
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+
+    for (const entry of entries) {
+        const absoluteEntryPath = path.join(currentDirectory, entry.name);
+        if (entry.isDirectory()) {
+            await collectDestinationFileStates(destinationRoot, absoluteEntryPath, fileStates);
+            continue;
+        }
+
+        const entryStats = await readExistingPathStats(absoluteEntryPath);
+        if (!entryStats) {
+            continue;
+        }
+
+        if (!entryStats.isFile()) {
+            continue;
+        }
+
+        fileStates.set(getRelativePathFromSource(destinationRoot, absoluteEntryPath), {
+            size: entryStats.size,
+            mtimeMs: entryStats.mtimeMs
+        });
+    }
+}
+
+/**
+ * Removes stale files and directories from every destination by checking whether the mirrored source path still exists.
+ *
+ * @param runtime Runtime state for the current job.
+ */
+async function pruneDestinations(runtime: IJobRuntime): Promise<void> {
     for (const destination of runtime.config.destinations) {
         if (!(await fs.pathExists(destination))) {
             continue;
         }
 
-        await pruneDestination(runtime, destination, sourceManifest);
+        await pruneDestination(runtime, destination, destination);
     }
 }
 
 /**
- * Removes stale files and directories from a single destination.
+ * Removes stale files and directories from a destination tree using source-path existence and type checks.
  *
  * @param runtime Runtime state for the current job.
- * @param destination Absolute destination root.
- * @param sourceManifest Mirrored source state computed from the source tree.
+ * @param destinationRoot Absolute destination root.
+ * @param currentDirectory Absolute destination directory currently being scanned.
  */
-async function pruneDestination(runtime: IJobRuntime, destination: string, sourceManifest: ISourceManifest): Promise<void> {
-    const destinationManifest = await buildDestinationManifest(destination);
+async function pruneDestination(runtime: IJobRuntime, destinationRoot: string, currentDirectory: string): Promise<void> {
+    let entries: fs.Dirent[];
 
-    for (const relativeFilePath of Array.from(destinationManifest.files).sort()) {
-        if (sourceManifest.files.has(relativeFilePath)) {
-            continue;
+    try {
+        entries = await fs.readdir(currentDirectory, { withFileTypes: true });
+    } catch (error) {
+        if (isMissingPathError(error)) {
+            return;
         }
 
-        await fs.remove(resolveRelativePath(destination, relativeFilePath));
-        log(`[${runtime.config.name}] Deleted stale file ${relativeFilePath}`);
+        throw error;
     }
 
-    const directoryPaths = Array.from(destinationManifest.directories).sort((left, right) => right.length - left.length);
-    for (const relativeDirectoryPath of directoryPaths) {
-        if (sourceManifest.directories.has(relativeDirectoryPath)) {
-            continue;
-        }
+    entries.sort((left, right) => left.name.localeCompare(right.name));
 
-        await fs.remove(resolveRelativePath(destination, relativeDirectoryPath));
-        log(`[${runtime.config.name}] Deleted stale directory ${relativeDirectoryPath}`);
-    }
-}
-
-/**
- * Builds a manifest of the current destination tree.
- *
- * @param destination Absolute destination root to inspect.
- */
-async function buildDestinationManifest(destination: string): Promise<ISourceManifest> {
-    const manifest: ISourceManifest = {
-        files: new Set<string>(),
-        directories: new Set<string>()
-    };
-
-    await collectDestinationManifest(destination, destination, manifest);
-    return manifest;
-}
-
-/**
- * Recursively collects destination entries into a manifest.
- *
- * @param destinationRoot Absolute root directory of the destination.
- * @param currentDirectory Absolute directory currently being scanned.
- * @param manifest Mutable destination manifest.
- */
-async function collectDestinationManifest(destinationRoot: string, currentDirectory: string, manifest: ISourceManifest): Promise<void> {
-    if (!(await fs.pathExists(currentDirectory))) {
-        return;
-    }
-
-    const entries = await fs.readdir(currentDirectory, { withFileTypes: true });
     for (const entry of entries) {
         const absoluteEntryPath = path.join(currentDirectory, entry.name);
         const relativePath = getRelativePathFromSource(destinationRoot, absoluteEntryPath);
+        const sourcePath = resolveRelativePath(runtime.config.source, relativePath);
 
         if (entry.isDirectory()) {
-            manifest.directories.add(relativePath);
-            await collectDestinationManifest(destinationRoot, absoluteEntryPath, manifest);
+            await pruneDestination(runtime, destinationRoot, absoluteEntryPath);
+
+            if ((await readMirrorableSourceEntryType(runtime, sourcePath)) === "directory") {
+                continue;
+            }
+
+            await fs.remove(absoluteEntryPath);
+            log(`[${runtime.config.name}] Deleted stale directory ${relativePath}`);
             continue;
         }
 
-        manifest.files.add(relativePath);
+        if ((await readMirrorableSourceEntryType(runtime, sourcePath)) === "file") {
+            continue;
+        }
+
+        await fs.remove(absoluteEntryPath);
+        log(`[${runtime.config.name}] Deleted stale file ${relativePath}`);
     }
 }
 
@@ -913,7 +1741,32 @@ async function collectDestinationManifest(destinationRoot: string, currentDirect
  * @param runtime Runtime state for the current job.
  * @param debounceMs Delay used to debounce full reloads after ignore file changes.
  */
-async function startWatcher(runtime: IJobRuntime, debounceMs: number): Promise<void> {
+async function startWatcher(runtime: IJobRuntime, debounceMs: number): Promise<boolean> {
+    const watcher = createWatcher(runtime, debounceMs);
+    runtime.watcher = watcher;
+
+    try {
+        await waitForWatcherStartup(watcher);
+    } catch (error) {
+        await handleWatcherStartupError(runtime, watcher, error);
+        return false;
+    }
+
+    watcher.on("error", (error: unknown) => {
+        void handleWatcherRuntimeError(runtime, watcher, error);
+    });
+
+    log(`[${runtime.config.name}] Watcher ready.`);
+    return true;
+}
+
+/**
+ * Creates and wires a chokidar watcher instance for the current runtime.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param debounceMs Delay used to debounce full reloads after ignore file changes.
+ */
+function createWatcher(runtime: IJobRuntime, debounceMs: number): FSWatcher {
     const watcher = chokidar.watch(runtime.config.source, {
         persistent: true,
         ignoreInitial: true,
@@ -932,11 +1785,9 @@ async function startWatcher(runtime: IJobRuntime, debounceMs: number): Promise<v
                 return true;
             }
 
-            return isIgnored(runtime, absolutePath);
+            return isIgnored(runtime, absolutePath, isExistingDirectoryPath(absolutePath));
         }
     });
-
-    runtime.watcher = watcher;
 
     watcher.on("add", (filePath) => {
         queueFileEvent(runtime, filePath, "add", debounceMs);
@@ -958,11 +1809,6 @@ async function startWatcher(runtime: IJobRuntime, debounceMs: number): Promise<v
         await handleDirectoryEvent(runtime, dirPath, "unlinkDir", debounceMs);
     });
 
-    watcher.on("error", (error) => {
-        void appendOperationalErrorLog(runtime, "watcher", runtime.config.source, error);
-        log(`[${runtime.config.name}] Watcher error: ${String(error)}`);
-    });
-
     watcher.on("all", (_event, changedPath) => {
         if (path.basename(changedPath) === IGNORE_FILE_NAME && !isOperationalPath(runtime.config.source, changedPath)) {
             log(`[${runtime.config.name}] ${IGNORE_FILE_NAME} changed. Reloading rules.`);
@@ -970,12 +1816,176 @@ async function startWatcher(runtime: IJobRuntime, debounceMs: number): Promise<v
         }
     });
 
-    await new Promise<void>((resolve) => {
-        watcher.once("ready", () => {
-            log(`[${runtime.config.name}] Watcher ready.`);
+    return watcher;
+}
+
+/**
+ * Waits for watcher startup and fails fast if chokidar cannot initialize the native watcher.
+ *
+ * @param watcher Watcher being started.
+ */
+async function waitForWatcherStartup(watcher: FSWatcher): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+        const onReady = () => {
+            cleanup();
             resolve();
-        });
+        };
+
+        const onError = (error: unknown) => {
+            cleanup();
+            reject(error);
+        };
+
+        const cleanup = () => {
+            watcher.off("ready", onReady);
+            watcher.off("error", onError);
+        };
+
+        watcher.once("ready", onReady);
+        watcher.on("error", onError);
     });
+}
+
+/**
+ * Handles watcher startup failures without aborting the full process when one job cannot be watched.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param watcher Watcher that failed during startup.
+ * @param error Error raised by chokidar.
+ */
+async function handleWatcherStartupError(runtime: IJobRuntime, watcher: FSWatcher, error: unknown): Promise<void> {
+    if (runtime.watcher === watcher) {
+        runtime.watcher = undefined;
+    }
+
+    await closeWatcherSafely(watcher);
+
+    if (!shouldLogWatcherError(runtime, error)) {
+        return;
+    }
+
+    await appendOperationalErrorLog(runtime, "watcher", runtime.config.source, error);
+    log(`[${runtime.config.name}] Watcher start failed: ${formatWatcherErrorMessage(error)}`);
+}
+
+/**
+ * Handles watcher errors raised after startup and throttles repeated logs for noisy watcher failures.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param watcher Watcher that raised the error.
+ * @param error Error raised by chokidar.
+ */
+async function handleWatcherRuntimeError(runtime: IJobRuntime, watcher: FSWatcher, error: unknown): Promise<void> {
+    if (runtime.watcher !== watcher) {
+        return;
+    }
+
+    if (!shouldLogWatcherError(runtime, error)) {
+        return;
+    }
+
+    await appendOperationalErrorLog(runtime, "watcher", runtime.config.source, error);
+    log(`[${runtime.config.name}] Watcher error: ${formatWatcherErrorMessage(error)}`);
+}
+
+/**
+ * Closes a watcher instance and ignores shutdown failures because recovery is already in progress.
+ *
+ * @param watcher Watcher instance to close.
+ */
+async function closeWatcherSafely(watcher: FSWatcher): Promise<void> {
+    try {
+        await watcher.close();
+    } catch {
+        return;
+    }
+}
+
+/**
+ * Suppresses repeated watcher errors for a short time window so the operational log stays readable.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param error Error raised by chokidar.
+ */
+function shouldLogWatcherError(runtime: IJobRuntime, error: unknown): boolean {
+    const key = getWatcherErrorLogKey(error);
+    const message = formatWatcherErrorMessage(error);
+    const logWindowMs = getWatcherErrorLogWindowMs(error);
+    const now = Date.now();
+    const watcherErrorState = runtime.watcherErrorState;
+
+    if (!watcherErrorState) {
+        runtime.watcherErrorState = {
+            key,
+            message,
+            suppressedCount: 0,
+            lastLoggedAt: now
+        };
+        return true;
+    }
+
+    if (watcherErrorState.key === key && now - watcherErrorState.lastLoggedAt < logWindowMs) {
+        watcherErrorState.message = message;
+        watcherErrorState.suppressedCount += 1;
+        return false;
+    }
+
+    runtime.watcherErrorState = {
+        key,
+        message,
+        suppressedCount: 0,
+        lastLoggedAt: now
+    };
+    return true;
+}
+
+/**
+ * Normalizes watcher errors to a stable log message so noisy descriptor-limit failures stay deduplicated.
+ *
+ * @param error Error raised by chokidar.
+ */
+function formatWatcherErrorMessage(error: unknown): string {
+    if (isWatcherLimitError(error)) {
+        return "Native watcher hit a system watch limit.";
+    }
+
+    return formatError(error);
+}
+
+/**
+ * Maps watcher errors to a stable throttling key so equivalent failures share the same log window.
+ *
+ * @param error Error raised by chokidar.
+ */
+function getWatcherErrorLogKey(error: unknown): string {
+    if (isWatcherLimitError(error)) {
+        return "WATCH_LIMIT";
+    }
+
+    return formatWatcherErrorMessage(error);
+}
+
+/**
+ * Chooses the throttling window used for a watcher error.
+ *
+ * @param error Error raised by chokidar.
+ */
+function getWatcherErrorLogWindowMs(error: unknown): number {
+    if (isWatcherLimitError(error)) {
+        return WATCHER_LIMIT_ERROR_LOG_WINDOW_MS;
+    }
+
+    return WATCHER_ERROR_LOG_WINDOW_MS;
+}
+
+/**
+ * Checks whether a watcher error is caused by OS-level watch descriptor limits.
+ *
+ * @param error Error raised by chokidar.
+ */
+function isWatcherLimitError(error: unknown): boolean {
+    const errorCode = readErrorCode(error);
+    return errorCode === "EMFILE" || errorCode === "ENOSPC";
 }
 
 /**
@@ -1135,7 +2145,7 @@ async function handleFileEvent(runtime: IJobRuntime, filePath: string, eventName
         return;
     }
 
-    if (eventName !== "unlink" && isIgnored(runtime, absolutePath)) {
+    if (eventName !== "unlink" && isIgnored(runtime, absolutePath, false)) {
         return;
     }
 
@@ -1180,6 +2190,10 @@ async function handleDirectoryEvent(runtime: IJobRuntime, dirPath: string, event
     }
 
     try {
+        if (eventName === "addDir") {
+            await syncDirectory(runtime, absolutePath);
+        }
+
         if (eventName === "unlinkDir" && runtime.config.deleteMissing) {
             await deleteDirectoryFromDestinations(runtime, absolutePath);
         }
@@ -1194,25 +2208,144 @@ async function handleDirectoryEvent(runtime: IJobRuntime, dirPath: string, event
 }
 
 /**
+ * Ensures a source directory exists in every configured destination, replacing blocking files when needed.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absoluteDirectoryPath Absolute path of the source directory to mirror.
+ */
+async function syncDirectory(runtime: IJobRuntime, absoluteDirectoryPath: string): Promise<void> {
+    const relativePath = getRelativePathFromSource(runtime.config.source, absoluteDirectoryPath);
+    let createdDestinationCount = 0;
+
+    for (const destination of runtime.config.destinations) {
+        const destinationPath = resolveRelativePath(destination, relativePath);
+        const destinationStats = await readExistingPathStats(destinationPath);
+        if (destinationStats && destinationStats.isDirectory()) {
+            continue;
+        }
+
+        if (destinationStats) {
+            await fs.remove(destinationPath);
+        }
+
+        await ensureDestinationParentDirectories(destination, relativePath);
+        await fs.ensureDir(destinationPath);
+        createdDestinationCount += 1;
+    }
+
+    /*if (createdDestinationCount > 0) {
+        log(`[${runtime.config.name}] Synced directory ${relativePath} to ${createdDestinationCount} destination(s).`);
+    }*/
+}
+
+/**
  * Copies a source file to every configured destination while preserving timestamps.
  *
  * @param runtime Runtime state for the current job.
  * @param absoluteFilePath Absolute path of the source file to sync.
+ * @param sourceFileState Optional source metadata already computed during a full reconciliation.
  */
-async function syncFile(runtime: IJobRuntime, absoluteFilePath: string): Promise<void> {
+async function syncFile(runtime: IJobRuntime, absoluteFilePath: string, sourceFileState?: IFileState): Promise<void> {
     const relativePath = getRelativePathFromSource(runtime.config.source, absoluteFilePath);
+    const effectiveSourceFileState = sourceFileState ?? await readFileState(absoluteFilePath);
+    let copiedDestinationCount = 0;
 
     for (const destination of runtime.config.destinations) {
         const destinationPath = resolveRelativePath(destination, relativePath);
-        await fs.ensureDir(path.dirname(destinationPath));
+        const destinationStats = await readExistingPathStats(destinationPath);
+        if (destinationStats && destinationStats.isFile() && areFileStatesEquivalent(effectiveSourceFileState, toFileState(destinationStats))) {
+            continue;
+        }
+
+        if (destinationStats && !destinationStats.isFile()) {
+            await fs.remove(destinationPath);
+        }
+
+        await ensureDestinationParentDirectories(destination, relativePath);
         await fs.copy(absoluteFilePath, destinationPath, {
             overwrite: true,
             preserveTimestamps: true,
             errorOnExist: false
         });
+        copiedDestinationCount += 1;
     }
 
-    log(`[${runtime.config.name}] Synced ${relativePath}`);
+    /*
+    if (copiedDestinationCount > 0) {
+        log(`[${runtime.config.name}] Synced ${relativePath}`);
+    }*/
+}
+
+/**
+ * Ensures every parent segment for a mirrored destination file is a directory, replacing blocking files when needed.
+ *
+ * @param destinationRoot Absolute destination root.
+ * @param relativeFilePath POSIX source-relative file path.
+ */
+async function ensureDestinationParentDirectories(destinationRoot: string, relativeFilePath: string): Promise<void> {
+    const parentSegments = relativeFilePath.split("/").slice(0, -1);
+
+    await fs.ensureDir(destinationRoot);
+
+    let currentPath = destinationRoot;
+    for (const segment of parentSegments) {
+        currentPath = path.join(currentPath, segment);
+
+        const currentStats = await readExistingPathStats(currentPath);
+        if (currentStats && !currentStats.isDirectory()) {
+            await fs.remove(currentPath);
+        }
+
+        await fs.ensureDir(currentPath);
+    }
+}
+
+/**
+ * Reads stats for a path and returns `undefined` when the path no longer exists or an ancestor is not a directory.
+ *
+ * @param absolutePath Absolute path to inspect.
+ */
+async function readExistingPathStats(absolutePath: string): Promise<Stats | undefined> {
+    try {
+        return await fs.stat(absolutePath);
+    } catch (error) {
+        if (isMissingPathError(error)) {
+            return undefined;
+        }
+
+        throw error;
+    }
+}
+
+/**
+ * Converts a file stat object into the lightweight metadata used for sync comparisons.
+ *
+ * @param fileStats File stat object to normalize.
+ */
+function toFileState(fileStats: Stats): IFileState {
+    return {
+        size: fileStats.size,
+        mtimeMs: fileStats.mtimeMs
+    };
+}
+
+/**
+ * Reads the comparison metadata for a file from disk.
+ *
+ * @param absolutePath Absolute file path to inspect.
+ */
+async function readFileState(absolutePath: string): Promise<IFileState> {
+    return toFileState(await fs.stat(absolutePath));
+}
+
+/**
+ * Checks whether two file states are equivalent for sync purposes.
+ *
+ * @param sourceFileState Source file metadata.
+ * @param destinationFileState Destination metadata.
+ */
+function areFileStatesEquivalent(sourceFileState: IFileState, destinationFileState: IFileState): boolean {
+    return sourceFileState.size === destinationFileState.size && sourceFileState.mtimeMs === destinationFileState.mtimeMs;
 }
 
 /**
@@ -1255,7 +2388,6 @@ async function deleteDirectoryFromDestinations(runtime: IJobRuntime, absoluteDir
  * @param runtime Runtime state for the current job.
  */
 async function ensureOperationalStateDirectory(runtime: IJobRuntime): Promise<void> {
-    await fs.ensureDir(runtime.internalIgnoreDirectory);
     await fs.ensureDir(runtime.internalAppDirectory);
     await fs.ensureFile(runtime.errorLogPath);
 }
@@ -1479,7 +2611,53 @@ function isOperationalPath(sourcePath: string, absolutePath: string): boolean {
         return false;
     }
 
-    return relativeToSource.split("/").includes(INTERNAL_IGNORE_DIRECTORY_NAME);
+    return relativeToSource.split("/").includes(INTERNAL_APP_DIRECTORY_NAME);
+}
+
+/**
+ * Checks whether a source path should exist in a mirrored destination after applying hidden and ignore rules.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute source path to evaluate.
+ * @param isDirectory Whether the path should be evaluated as a directory candidate.
+ */
+function shouldMirrorSourcePath(runtime: IJobRuntime, absolutePath: string, isDirectory: boolean = false): boolean {
+    if (path.basename(absolutePath) === IGNORE_FILE_NAME || isOperationalPath(runtime.config.source, absolutePath)) {
+        return false;
+    }
+
+    if (!runtime.config.watchHidden && isHiddenPath(runtime.config.source, absolutePath)) {
+        return false;
+    }
+
+    return !isIgnored(runtime, absolutePath, isDirectory);
+}
+
+/**
+ * Reads the effective mirrored type for a source path after ignore rules and filesystem existence are applied.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute source path to inspect.
+ */
+async function readMirrorableSourceEntryType(runtime: IJobRuntime, absolutePath: string): Promise<SourceEntryType | undefined> {
+    const sourceStats = await readExistingPathStats(absolutePath);
+    if (!sourceStats) {
+        return undefined;
+    }
+
+    if (!shouldMirrorSourcePath(runtime, absolutePath, sourceStats.isDirectory())) {
+        return undefined;
+    }
+
+    if (sourceStats.isDirectory()) {
+        return "directory";
+    }
+
+    if (sourceStats.isFile()) {
+        return "file";
+    }
+
+    return undefined;
 }
 
 /**
@@ -1487,21 +2665,29 @@ function isOperationalPath(sourcePath: string, absolutePath: string): boolean {
  *
  * @param matcher Ignore matcher instance.
  * @param candidate Source-relative candidate path.
+ * @param isDirectory Whether the candidate should be evaluated as a directory.
  */
-function testIgnoreMatcher(matcher: ReturnType<typeof ignore>, candidate: string): { ignored: boolean; unignored: boolean } {
-    const directResult = matcher.test(candidate);
-    if (directResult.ignored || directResult.unignored || candidate.endsWith("/")) {
-        return {
-            ignored: directResult.ignored,
-            unignored: directResult.unignored
-        };
-    }
+function testIgnoreMatcher(matcher: ReturnType<typeof ignore>, candidate: string, isDirectory: boolean = false): { ignored: boolean; unignored: boolean } {
+    const effectiveCandidate = isDirectory && !candidate.endsWith("/") ? `${candidate}/` : candidate;
+    const result = matcher.test(effectiveCandidate);
 
-    const directoryResult = matcher.test(`${candidate}/`);
     return {
-        ignored: directoryResult.ignored,
-        unignored: directoryResult.unignored
+        ignored: result.ignored,
+        unignored: result.unignored
     };
+}
+
+/**
+ * Checks whether an existing path currently points to a directory.
+ *
+ * @param absolutePath Absolute path to inspect.
+ */
+function isExistingDirectoryPath(absolutePath: string): boolean {
+    try {
+        return fs.statSync(absolutePath).isDirectory();
+    } catch {
+        return false;
+    }
 }
 
 /**
@@ -1551,6 +2737,19 @@ function readNonEmptyString(value: unknown, fieldName: string): string {
 }
 
 /**
+ * Reads an optional non-empty string and returns `undefined` when the value is missing or blank.
+ *
+ * @param value Parsed field value.
+ */
+function readOptionalNonEmptyString(value: unknown): string | undefined {
+    if (typeof value !== "string" || !value.trim()) {
+        return undefined;
+    }
+
+    return value.trim();
+}
+
+/**
  * Reads an optional boolean field from an object.
  *
  * @param value Parsed field value.
@@ -1580,6 +2779,15 @@ function readNonNegativeInteger(value: unknown, fieldName: string): number {
     }
 
     return Number(value);
+}
+
+/**
+ * Checks whether a parsed value is a non-negative integer.
+ *
+ * @param value Parsed value to validate.
+ */
+function isNonNegativeInteger(value: unknown): value is number {
+    return Number.isInteger(value) && Number(value) >= 0;
 }
 
 /**
@@ -1639,15 +2847,20 @@ function queueRuntimeFullSync(runtime: IJobRuntime, debounceMs: number, reason: 
     }
 
     runtime.fullSyncTimer = setTimeout(async () => {
+        let startedFullSync = false;
+
         try {
             if (shouldReloadIgnoreFiles) {
                 await reloadIgnoreFiles(runtime);
             }
 
             log(`[${runtime.config.name}] ${reason} Running reconciliation.`);
+            startedFullSync = true;
             await runFullSync(runtime, "Full sync");
         } catch (error) {
-            await appendOperationalErrorLog(runtime, "full sync", runtime.config.source, error);
+            if (!startedFullSync) {
+                await appendOperationalErrorLog(runtime, "full sync", runtime.config.source, error);
+            }
             log(`[${runtime.config.name}] Full sync failed: ${formatError(error)}`);
         }
     }, debounceMs);
@@ -1703,6 +2916,30 @@ function formatError(error: unknown): string {
     return String(error);
 }
 
+/**
+ * Extracts a string error code from an unknown runtime error.
+ *
+ * @param error Error value thrown by the runtime.
+ */
+function readErrorCode(error: unknown): string | undefined {
+    if (!error || typeof error !== "object" || !("code" in error)) {
+        return undefined;
+    }
+
+    const candidateCode = (error as { code?: unknown }).code;
+    return typeof candidateCode === "string" ? candidateCode : undefined;
+}
+
+/**
+ * Checks whether an error means a filesystem path is effectively missing for traversal purposes.
+ *
+ * @param error Error value thrown by the runtime.
+ */
+function isMissingPathError(error: unknown): boolean {
+    const errorCode = readErrorCode(error);
+    return errorCode === "ENOENT" || errorCode === "ENOTDIR";
+}
+
 const isDirectExecution = typeof require !== "undefined" && typeof module !== "undefined" && require.main === module;
 
 if (isDirectExecution) {
@@ -1712,4 +2949,4 @@ if (isDirectExecution) {
     });
 }
 
-export { analyzeRuntime, appendOperationalErrorLog, createInstalledLauncherContent, createPathExportBlock, createRuntime, flushQueuedFileEvent, getConfigPath, getRetryDelayMs, handleDirectoryEvent, handleFileEvent, isHiddenPath, isIgnored, isPathInsideSource, main, parseCliArguments, queueFileEvent, readConfig, reconcileRuntimes, reloadIgnoreFiles, resolveConfiguredPath, runFullSync, runInitialSync, startWatcher, syncFile };
+export { analyzeRuntime, appendOperationalErrorLog, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, flushQueuedFileEvent, getConfigPath, getRetryDelayMs, handleDirectoryEvent, handleFileEvent, installGlobalCli, isHiddenPath, isIgnored, isPathInsideSource, isWatcherLimitError, main, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, readErrorCode, reconcileRuntimes, reloadIgnoreFiles, renderInstallConfigContent, renderLaunchAgentTemplate, resolveConfiguredPath, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, startWatcher, syncFile };

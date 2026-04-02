@@ -27,6 +27,3 @@ dist/
 build/
 coverage/
 .cache/
-
-# Runtime state
-_fmirrorignore/

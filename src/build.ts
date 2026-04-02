@@ -15,9 +15,11 @@ interface IPackageMetadata {
 }
 
 const OUTPUT_DIRECTORY_PATH = path.resolve(process.cwd(), "dist");
+const OUTPUT_TEMPLATE_DIRECTORY_PATH = path.join(OUTPUT_DIRECTORY_PATH, "templates");
 const ENTRY_POINT_PATH = path.resolve(process.cwd(), "src", "index.ts");
 const OUTPUT_BUNDLE_PATH = path.join(OUTPUT_DIRECTORY_PATH, "fmirror.js");
 const PACKAGE_JSON_PATH = path.resolve(process.cwd(), "package.json");
+const TEMPLATE_DIRECTORY_PATH = path.resolve(process.cwd(), "templates");
 
 /**
  * Builds the distributable bundle.
@@ -39,6 +41,8 @@ async function build(): Promise<void> {
             js: banner
         }
     });
+
+    await fs.copy(TEMPLATE_DIRECTORY_PATH, OUTPUT_TEMPLATE_DIRECTORY_PATH);
 }
 
 /**

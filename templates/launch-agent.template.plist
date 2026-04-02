@@ -3,16 +3,16 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.danieleperilli.fmirror</string>
+    <string>{{LABEL}}</string>
 
     <key>WorkingDirectory</key>
-    <string>/absolute/path/to/fmirror</string>
+    <string>{{WORKING_DIRECTORY}}</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>node</string>
-        <string>dist/fmirror.js</string>
+        <string>{{NODE_PATH}}</string>
+        <string>{{BUNDLE_PATH}}</string>
+        <string>{{CONFIG_PATH}}</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -22,9 +22,9 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/tmp/fmirror.log</string>
+    <string>{{STANDARD_OUT_PATH}}</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/fmirror-error.log</string>
+    <string>{{STANDARD_ERROR_PATH}}</string>
 </dict>
 </plist>

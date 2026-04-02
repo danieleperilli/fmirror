@@ -1,8 +1,8 @@
 {
     "name": "fmirror",
-    "version": "0.1.0",
+    "version": "0.7.0",
     "private": true,
-    "description": "Watch source folders and sync them to one or more destinations respecting .fmirrorignore files.",
+    "description": "Watch source folders and sync them to one or more destinations respecting .fmirror-ignore files.",
     "main": "dist/fmirror.js",
     "type": "commonjs",
     "engines": {

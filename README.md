@@ -2,7 +2,7 @@
 
 A small TypeScript/NodeJS utility that watches one or more source folders and mirrors them to one or more destination folders.
 
-It reads its jobs from `fmirror.config.json`, watches for changes, performs an initial full reconciliation, and supports `.fmirrorignore` files with Git-style ignore syntax.
+It reads its jobs from a JSON config file, watches for changes, performs an initial full reconciliation, and supports `.fmirror-ignore` files with Git-style ignore syntax.
 
 ## Features
 
@@ -11,17 +11,18 @@ It reads its jobs from `fmirror.config.json`, watches for changes, performs an i
 - Runs an initial full reconciliation before entering watch mode
 - Supports one-shot reconciliation and analysis commands
 - Deletes removed files from destinations
+- Preserves empty directories
 - Supports hidden files
-- Supports one or more `.fmirrorignore` files inside each source tree
+- Supports one or more `.fmirror-ignore` files inside each source tree
 - Coalesces repeated file changes on the same path before syncing
-- Reserves `_fmirrorignore/` for internal operational files and always excludes it from mirroring
-- Stores operational data in `_fmirrorignore/fmirror/`, including `sync-errors.log` and `queue.json`
-- Can install the built CLI into `~/fmirror` and add it to `PATH`
-- `.fmirrorignore` uses the same pattern syntax you already know from `.gitignore`
+- Reserves `.fmirror/` for internal operational files and always excludes it from mirroring
+- Stores operational data in `.fmirror/`, including `sync-error.log` and `queue.json`
+- Can install the CLI globally in `~/fmirror` and bootstrap a source folder with `.fmirror/config.json`, `.fmirror-ignore`, and a macOS LaunchAgent
+- `.fmirror-ignore` uses the same pattern syntax you already know from `.gitignore`
 
-## How `.fmirrorignore` works
+## How `.fmirror-ignore` works
 
-Create a `.fmirrorignore` file anywhere inside a watched source tree.
+Create a `.fmirror-ignore` file anywhere inside a watched source tree.
 
 Examples:
 
@@ -34,21 +35,21 @@ dist/
 coverage/
 ```
 
-Nested `.fmirrorignore` files are supported. Each file applies to its own folder, like `.gitignore`.
+Nested `.fmirror-ignore` files are supported. Each file applies to its own folder, like `.gitignore`.
 
-See [fmirrorignore.sample.txt](samples/fmirrorignore.sample.txt) for more example patterns.
+See [fmirror-ignore.template](templates/fmirror-ignore.template) for more example patterns.
 
 ## Reserved operational folder
 
-Each watched source root gets an automatically created `_fmirrorignore` folder.
+Each watched source root gets an automatically created `.fmirror` folder.
 
-This folder is always ignored by the app, even without any `.fmirrorignore` rule, so its contents are never mirrored to destinations.
+This folder is always ignored by the app, even without any `.fmirror-ignore` rule, so its contents are never mirrored to destinations.
 
-Inside `_fmirrorignore`, the app creates `_fmirrorignore/fmirror/` to store its own state.
+Inside `.fmirror`, the app stores its own state.
 
-The file `_fmirrorignore/fmirror/sync-errors.log` stores operational errors raised during sync, full rescan, watcher handling, or queue recovery.
+The file `.fmirror/sync-error.log` stores operational errors raised during sync, full rescan, watcher handling, or queue recovery.
 
-The file `_fmirrorignore/fmirror/queue.json` stores the in-memory file queue on disk so pending file events can be recovered and replayed after a restart.
+The file `.fmirror/queue.json` stores the in-memory file queue on disk so pending file events can be recovered and replayed after a restart.
 
 ## Requirements
 
@@ -64,7 +65,7 @@ Clone or copy this project locally, then run:
 ```bash
 npm install
 npm run build
-cp samples/config.sample.json fmirror.config.json
+cp templates/config.template.json fmirror.config.json
 ```
 
 Edit `fmirror.config.json` and then start the watcher:
@@ -85,9 +86,7 @@ npm run dev
 
 If you run `node dist/fmirror.js` without arguments, the app looks for `fmirror.config.json` in the same folder as `dist/fmirror.js`.
 
-### CLI installation
-
-If you want to run `fmirror` directly from the terminal, build it and install the local CLI:
+### Mirror installation
 
 ```bash
 npm install
@@ -99,40 +98,61 @@ This command:
 
 - copies the built bundle to `~/fmirror/fmirror.js`
 - creates the launcher `~/fmirror/fmirror`
+- copies the install templates to `~/fmirror/templates`
 - appends `~/fmirror` to your shell `PATH` if needed
 
-After installation, reload your shell or open a new terminal.
-
-If you want the installed CLI to work without passing a config path every time, place the config here:
+After that, set up a mirror:
 
 ```bash
-cp samples/config.sample.json ~/fmirror/fmirror.config.json
+fmirror setup -s /absolute/path/to/source -d /absolute/path/to/destination
 ```
 
-Then you can start it directly with:
+Or, before reloading your shell:
 
 ```bash
-fmirror
+~/fmirror/fmirror setup -s /absolute/path/to/source -d /absolute/path/to/destination
 ```
 
-If your config lives somewhere else, pass it explicitly:
+The `setup` command:
+
+- creates `/absolute/path/to/source/.fmirror/config.json`
+- creates `/absolute/path/to/source/.fmirror-ignore` if it does not already exist
+- on macOS, creates `~/Library/LaunchAgents/com.fmirror-source-folder-slug.plist`
+- on macOS, reloads that LaunchAgent automatically
+- on macOS, creates a symlink to the installed plist inside `/absolute/path/to/source/.fmirror/`
+
+The generated config always points to the source and destination you pass to `setup`.
+
+If `-s` or `-d` is missing, `setup` stops with an error.
+
+If the global CLI is missing, `setup` also stops with an error and asks you to run `fmirror install` first.
+
+The install flow uses the built `dist/fmirror.js` only as the source bundle for the global installation, so `npm run build` must succeed first.
+
+After the first install, reload your shell or open a new terminal if you want to use `fmirror` directly from `PATH`.
+
+To run the generated config manually:
 
 ```bash
-fmirror /absolute/path/to/fmirror.config.json
+fmirror /absolute/path/to/source/.fmirror/config.json
 ```
 
 ## Commands
 
 - `fmirror [config-path]`: starts watch mode. This is the default command.
-- `fmirror analyze [config-path]`: scans all included source files, prints the included file count and total size, and writes `_fmirrorignore/fmirror/source-analysis.log` inside each source tree.
+- `fmirror -fast-start [config-path]`: starts watch mode without the initial full reconciliation. Use this only when you explicitly want a faster startup and accept that destinations may stay stale until later events or a manual reconciliation.
+- `fmirror analyze [config-path]`: scans all included source files, prints the included file count and total size, and writes `.fmirror/source-analysis.log` inside each source tree.
 - `fmirror reconcile [config-path]`: performs a one-shot reconciliation. Missing files are copied to each destination and extra files are removed.
-- `fmirror install`: copies the built CLI to `~/fmirror`, creates the `fmirror` launcher, and appends `~/fmirror` to your shell `PATH` if needed.
+- `fmirror install`: installs or refreshes the global CLI in `~/fmirror` and updates your shell `PATH` when needed.
+- `fmirror setup -s <source-path> -d <destination-path>`: creates `source/.fmirror/config.json`, ensures `source/.fmirror-ignore`, and on macOS installs a LaunchAgent for that source automatically.
 
 Useful npm shortcuts:
 
 - `npm run analyze`
 - `npm run reconcile`
 - `npm run install:local`
+
+By default, watch mode performs a full reconciliation before the watcher becomes active. During that pass, destinations are checked using `name + size + mtime`. Pass `-fast-start` or `--fast-start` only if you want to skip that initial sync.
 
 ## Config format
 
@@ -159,7 +179,7 @@ Example `fmirror.config.json`:
 
 ### Config fields
 
-- `debounceMs`: delay used when a `.fmirrorignore` file changes before running a full reconciliation
+- `debounceMs`: delay used when a `.fmirror-ignore` file changes before running a full reconciliation
 - `fileDebounceMs`: delay used to coalesce repeated file events on the same path before syncing
 - `jobs`: list of sync jobs
 
@@ -167,9 +187,17 @@ Each job contains:
 
 - `name`: label shown in logs
 - `source`: folder to watch
-- `destinations`: one or more target folders
+- `destinations`: one or more target folders expressed as strings
 - `deleteMissing`: if `true`, removes files from destinations when they are deleted from the source
 - `watchHidden`: if `true`, includes dotfiles during the initial sync and watcher processing
+
+Example:
+
+```json
+"destinations": [
+    "/Volumes/NAS/backups/my-project"
+]
+```
 
 Relative `source` and `destinations` paths are resolved from the directory that contains `fmirror.config.json`.
 
@@ -196,7 +224,7 @@ Destination inside Google Drive:
 Inside your source project, create:
 
 ```text
-/Users/your-user/dev/my-project/.fmirrorignore
+/Users/your-user/dev/my-project/.fmirror-ignore
 ```
 
 With content:
@@ -210,9 +238,66 @@ dist/
 
 Then run the watcher. The destination will stay updated without uploading ignored files.
 
+## Git repositories
+
+The recommended way to mirror a Git repository is to mirror the working tree only, with a minimal files and folders from the `.git` directory needed for bootstrapping.
+
+Recommended `.fmirror-ignore` content for Git repositories:
+
+```gitignore
+**/.git/**
+!**/.git/
+!**/.git/HEAD
+!**/.git/config
+!**/.git/objects
+
+!**/.git/refs/
+!**/.git/info/
+!**/.git/info/sparse-checkout
+```
+
+This configuration ignores all `.git` files and folders except the minimal set needed to restore the full `.git` directory in the mirrored copy.
+After the first mirror, you can run the following commands inside the mirrored copy to restore a working Git repository:
+
+```bash
+git fetch --all --tags
+git checkout -B main origin/main -f
+```
+
+If `origin/main` already exists locally, you can also use:
+
+```bash
+git reset --hard origin/main
+```
+
+Replace `main` with the correct default branch for your repository.
+
+If the repository uses submodules, run:
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
 ## Automatic startup on macOS with launchd
 
-Create a LaunchAgent file:
+`fmirror setup -s <source-path> -d <destination-path>` creates and installs the LaunchAgent automatically on macOS.
+
+The installed file name is:
+
+```text
+~/Library/LaunchAgents/com.fmirror-source-folder-slug.plist
+```
+
+The same file is also linked inside:
+
+```text
+/absolute/path/to/source/.fmirror/fmirror-source-folder-slug.plist
+```
+
+If you want to edit the template used to generate it, start from [launch-agent.template.plist](templates/launch-agent.template.plist).
+
+For `launchd`, prefer absolute paths and do not rely on the shell `PATH`. The generated agent calls `node` directly with the globally installed `~/fmirror/fmirror.js` bundle and the generated `source/.fmirror/config.json`.
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -220,16 +305,16 @@ Create a LaunchAgent file:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.danieleperilli.fmirror</string>
+    <string>com.fmirror.source-folder-slug</string>
 
     <key>WorkingDirectory</key>
-    <string>/absolute/path/to/fmirror</string>
+    <string>/absolute/path/to/source</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>node</string>
-        <string>dist/fmirror.js</string>
+        <string>/absolute/path/to/node</string>
+        <string>/Users/your-user/fmirror/fmirror.js</string>
+        <string>/absolute/path/to/source/.fmirror/config.json</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -239,38 +324,33 @@ Create a LaunchAgent file:
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/tmp/fmirror.log</string>
+    <string>/absolute/path/to/source/.fmirror/launchd.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/fmirror-error.log</string>
+    <string>/absolute/path/to/source/.fmirror/launchd-error.log</string>
 </dict>
 </plist>
 ```
 
-Save it as:
-
-```text
-~/Library/LaunchAgents/com.danieleperilli.fmirror.plist
-```
-
-Then load it:
+To run the same config interactively:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.danieleperilli.fmirror.plist
+fmirror /absolute/path/to/source/.fmirror/config.json
 ```
 
 To reload it after changes:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.danieleperilli.fmirror.plist
-launchctl load ~/Library/LaunchAgents/com.danieleperilli.fmirror.plist
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.fmirror-source-folder-slug.plist
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.fmirror-source-folder-slug.plist
 ```
 
 ## Notes
 
 - This tool mirrors files. It is not a bidirectional sync.
 - Destination changes are not copied back to the source.
-- If a `.fmirrorignore` file changes, the app reloads ignore rules and performs a full reconciliation.
+- If a `.fmirror-ignore` file changes, the app reloads ignore rules and performs a full reconciliation.
+- If the native watcher hits the system open-file limit, the app logs the watcher error and keeps those repeated limit errors throttled so the logs stay readable.
 - Directory-level moves and structural changes schedule a reconciliation automatically, so rename and move operations converge to the final tree state even when raw watcher events are noisy.
 - Large bursts of file events also trigger a reconciliation fallback, which makes mass deletions and large refactors more reliable.
 - When `deleteMissing` is `true`, startup and ignore reloads also remove stale files from destinations so they match the current mirrored source state.

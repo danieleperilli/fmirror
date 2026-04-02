@@ -6,11 +6,11 @@
 	],
 	"settings": {
 		"cSpell.words": [
-			"fmirrorignore"
+			"fmirror"
 		],
 		"files.associations": {
-			".fmirrorignore": "ignore",
-			"fmirrorignore.sample.txt": "ignore"
+			".fmirror-ignore": "ignore",
+			"fmirror-ignore.template": "ignore"
 		}
 	}
 }

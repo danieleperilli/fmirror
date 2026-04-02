@@ -53,7 +53,6 @@ export interface IPersistedQueueState {
 export interface IJobRuntime {
     config: INormalizedJobConfig;
     ignoreFiles: IIgnoreFile[];
-    internalIgnoreDirectory: string;
     internalAppDirectory: string;
     errorLogPath: string;
     queueFilePath: string;
@@ -62,6 +61,7 @@ export interface IJobRuntime {
     recoveredQueuePaths: string[];
     queuePersistencePromise: Promise<void>;
     fileEventBurstCount: number;
+    watcherErrorState?: IWatcherErrorState;
     watcher?: FSWatcher;
     fullSyncTimer?: NodeJS.Timeout;
     fileEventBurstTimer?: NodeJS.Timeout;
@@ -75,20 +75,38 @@ export interface INormalizedJobConfig {
     watchHidden: boolean;
 }
 
-export interface ISourceManifest {
-    files: Set<string>;
-    directories: Set<string>;
+export interface IFileState {
+    size: number;
+    mtimeMs: number;
 }
 
-export type CliCommandName = "watch" | "analyze" | "reconcile" | "install";
+export type CliCommandName = "watch" | "analyze" | "reconcile" | "install" | "setup";
 
 export interface ICliArguments {
     command: CliCommandName;
     configPath?: string;
+    fastStart: boolean;
 }
 
 export interface IRuntimeAnalysis {
     fileCount: number;
     totalSizeBytes: number;
     logPath: string;
+    destinationAnalyses: IDestinationAnalysis[];
+}
+
+export interface IWatcherErrorState {
+    key: string;
+    message: string;
+    suppressedCount: number;
+    lastLoggedAt: number;
+}
+
+export interface IDestinationAnalysis {
+    path: string;
+    fileCount: number;
+    totalSizeBytes: number;
+    missingFileCount: number;
+    outdatedFileCount: number;
+    extraFileCount: number;
 }
