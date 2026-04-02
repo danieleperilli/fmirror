@@ -31,6 +31,7 @@ const FILE_EVENT_BURST_WINDOW_MS = 1000;
 const FILE_EVENT_BURST_THRESHOLD = 20;
 const WATCHER_ERROR_LOG_WINDOW_MS = 30000;
 const WATCHER_LIMIT_ERROR_LOG_WINDOW_MS = 300000;
+const FILE_STATE_MTIME_TOLERANCE_MS = 10;
 const INSTALL_DIRECTORY_NAME = "fmirror";
 const INSTALL_EXECUTABLE_FILE_NAME = "fmirror";
 const INSTALL_BUNDLE_FILE_NAME = "fmirror.js";
@@ -616,7 +617,7 @@ async function runFullSync(runtime: IJobRuntime, label: string): Promise<void> {
         });
 
         await visitSourceFiles(runtime, runtime.config.source, async (sourceFile) => {
-            await syncFile(runtime, sourceFile.absolutePath, sourceFile.fileState);
+            await syncFile(runtime, sourceFile.absolutePath, sourceFile.fileState, true);
         });
 
         if (runtime.config.deleteMissing) {
@@ -2244,16 +2245,21 @@ async function syncDirectory(runtime: IJobRuntime, absoluteDirectoryPath: string
  * @param runtime Runtime state for the current job.
  * @param absoluteFilePath Absolute path of the source file to sync.
  * @param sourceFileState Optional source metadata already computed during a full reconciliation.
+ * @param shouldSkipEquivalentDestinations When true, destinations deemed equivalent are left untouched.
  */
-async function syncFile(runtime: IJobRuntime, absoluteFilePath: string, sourceFileState?: IFileState): Promise<void> {
+async function syncFile(runtime: IJobRuntime, absoluteFilePath: string, sourceFileState?: IFileState, shouldSkipEquivalentDestinations: boolean = false): Promise<void> {
     const relativePath = getRelativePathFromSource(runtime.config.source, absoluteFilePath);
-    const effectiveSourceFileState = sourceFileState ?? await readFileState(absoluteFilePath);
+    let effectiveSourceFileState = sourceFileState;
     let copiedDestinationCount = 0;
+
+    if (shouldSkipEquivalentDestinations && !effectiveSourceFileState) {
+        effectiveSourceFileState = await readFileState(absoluteFilePath);
+    }
 
     for (const destination of runtime.config.destinations) {
         const destinationPath = resolveRelativePath(destination, relativePath);
         const destinationStats = await readExistingPathStats(destinationPath);
-        if (destinationStats && destinationStats.isFile() && areFileStatesEquivalent(effectiveSourceFileState, toFileState(destinationStats))) {
+        if (shouldSkipEquivalentDestinations && effectiveSourceFileState && destinationStats && destinationStats.isFile() && areFileStatesEquivalent(effectiveSourceFileState, toFileState(destinationStats))) {
             continue;
         }
 
@@ -2339,13 +2345,13 @@ async function readFileState(absolutePath: string): Promise<IFileState> {
 }
 
 /**
- * Checks whether two file states are equivalent for sync purposes.
+ * Checks whether two file states should be treated as equivalent during analysis and sync.
  *
  * @param sourceFileState Source file metadata.
  * @param destinationFileState Destination metadata.
  */
 function areFileStatesEquivalent(sourceFileState: IFileState, destinationFileState: IFileState): boolean {
-    return sourceFileState.size === destinationFileState.size && sourceFileState.mtimeMs === destinationFileState.mtimeMs;
+    return sourceFileState.size === destinationFileState.size && Math.abs(sourceFileState.mtimeMs - destinationFileState.mtimeMs) <= FILE_STATE_MTIME_TOLERANCE_MS;
 }
 
 /**

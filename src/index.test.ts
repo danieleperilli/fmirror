@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import fs from "fs-extra";
 import type { IJobRuntime } from "./interfaces";
-import { analyzeRuntime, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, getConfigPath, handleDirectoryEvent, installGlobalCli, isWatcherLimitError, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, renderInstallConfigContent, renderLaunchAgentTemplate, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, syncFile } from "./index";
+import { analyzeRuntime, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, getConfigPath, handleDirectoryEvent, handleFileEvent, installGlobalCli, isWatcherLimitError, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, renderInstallConfigContent, renderLaunchAgentTemplate, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, syncFile } from "./index";
 
 test("getConfigPath prefers the CLI argument", async () => {
     const resolvedPath = getConfigPath([
@@ -431,7 +431,7 @@ test("runFullSync skips source files that disappear during source scanning", asy
     }
 });
 
-test("syncFile skips copying when size and mtime already match", async () => {
+test("syncFile skips copying during reconciliation when size and mtime already match", async () => {
     const tempDirectory = await createTempDirectory();
     const sourcePath = path.join(tempDirectory, "source");
     const destinationPath = path.join(tempDirectory, "destination");
@@ -457,7 +457,11 @@ test("syncFile skips copying when size and mtime already match", async () => {
     }, 25);
 
     try {
-        await syncFile(runtime, sourceFilePath);
+        const sourceStats = await fs.stat(sourceFilePath);
+        await syncFile(runtime, sourceFilePath, {
+            size: sourceStats.size,
+            mtimeMs: sourceStats.mtimeMs
+        }, true);
 
         const destinationStats = await fs.stat(destinationFilePath);
         assert.equal(await fs.readFile(destinationFilePath, "utf8"), "payload");
@@ -467,7 +471,7 @@ test("syncFile skips copying when size and mtime already match", async () => {
     }
 });
 
-test("syncFile replaces same-sized stale destination files", async () => {
+test("syncFile replaces same-sized stale destination files during reconciliation", async () => {
     const tempDirectory = await createTempDirectory();
     const sourcePath = path.join(tempDirectory, "source");
     const destinationPath = path.join(tempDirectory, "destination");
@@ -494,11 +498,135 @@ test("syncFile replaces same-sized stale destination files", async () => {
     }, 25);
 
     try {
-        await syncFile(runtime, sourceFilePath);
+        const sourceStats = await fs.stat(sourceFilePath);
+        await syncFile(runtime, sourceFilePath, {
+            size: sourceStats.size,
+            mtimeMs: sourceStats.mtimeMs
+        }, true);
 
         const destinationStats = await fs.stat(destinationFilePath);
         assert.equal(await fs.readFile(destinationFilePath, "utf8"), "abc");
         assert.equal(Math.trunc(destinationStats.mtimeMs), sourceTimestamp.getTime());
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("syncFile skips copying during reconciliation when content matches within the timestamp tolerance", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+    const destinationFilePath = path.join(destinationPath, "keep.txt");
+    const baseTimestampMs = Date.parse("2026-04-01T10:00:00.000Z");
+
+    await fs.ensureDir(sourcePath);
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(sourceFilePath, "payload", "utf8");
+    await fs.writeFile(destinationFilePath, "payload", "utf8");
+    await fs.utimes(sourceFilePath, baseTimestampMs / 1000, baseTimestampMs / 1000);
+    await fs.utimes(destinationFilePath, baseTimestampMs / 1000, (baseTimestampMs + 10) / 1000);
+
+    const runtime = await createRuntime({
+        name: "skip-tolerant-copy",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        const destinationBeforeSyncStats = await fs.stat(destinationFilePath);
+        const sourceStats = await fs.stat(sourceFilePath);
+
+        await syncFile(runtime, sourceFilePath, {
+            size: sourceStats.size,
+            mtimeMs: sourceStats.mtimeMs
+        }, true);
+
+        const destinationAfterSyncStats = await fs.stat(destinationFilePath);
+        assert.equal(await fs.readFile(destinationFilePath, "utf8"), "payload");
+        assert.equal(destinationAfterSyncStats.mtimeMs, destinationBeforeSyncStats.mtimeMs);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("syncFile treats same-sized destination files within the timestamp tolerance as current during reconciliation even when content differs", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+    const destinationFilePath = path.join(destinationPath, "keep.txt");
+    const baseTimestampMs = Date.parse("2026-04-01T10:00:00.000Z");
+
+    await fs.ensureDir(sourcePath);
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(sourceFilePath, "abc", "utf8");
+    await fs.writeFile(destinationFilePath, "xyz", "utf8");
+    await fs.utimes(sourceFilePath, baseTimestampMs / 1000, baseTimestampMs / 1000);
+    await fs.utimes(destinationFilePath, baseTimestampMs / 1000, (baseTimestampMs + 10) / 1000);
+
+    const runtime = await createRuntime({
+        name: "replace-tolerant-stale-copy",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        const destinationBeforeSyncStats = await fs.stat(destinationFilePath);
+        const sourceStats = await fs.stat(sourceFilePath);
+
+        await syncFile(runtime, sourceFilePath, {
+            size: sourceStats.size,
+            mtimeMs: sourceStats.mtimeMs
+        }, true);
+
+        const destinationAfterSyncStats = await fs.stat(destinationFilePath);
+        assert.equal(await fs.readFile(destinationFilePath, "utf8"), "xyz");
+        assert.equal(destinationAfterSyncStats.mtimeMs, destinationBeforeSyncStats.mtimeMs);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("handleFileEvent resyncs changed files even when size and mtime stay within the timestamp tolerance", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+    const destinationFilePath = path.join(destinationPath, "keep.txt");
+    const baseTimestampMs = Date.parse("2026-04-01T10:00:00.000Z");
+
+    await fs.ensureDir(sourcePath);
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(sourceFilePath, "abc", "utf8");
+    await fs.writeFile(destinationFilePath, "xyz", "utf8");
+    await fs.utimes(sourceFilePath, baseTimestampMs / 1000, baseTimestampMs / 1000);
+    await fs.utimes(destinationFilePath, baseTimestampMs / 1000, (baseTimestampMs + 10) / 1000);
+
+    const runtime = await createRuntime({
+        name: "watch-resync",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        await handleFileEvent(runtime, sourceFilePath, "change");
+
+        const destinationStats = await fs.stat(destinationFilePath);
+        assert.equal(await fs.readFile(destinationFilePath, "utf8"), "abc");
+        assert.equal(Math.trunc(destinationStats.mtimeMs), baseTimestampMs);
     } finally {
         await disposeRuntime(runtime);
     }
@@ -575,23 +703,135 @@ test("analyzeRuntime reads destination metadata from the filesystem", async () =
     }
 });
 
+test("analyzeRuntime treats destination files within the timestamp tolerance as current", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+    const destinationFilePath = path.join(destinationPath, "keep.txt");
+    const baseTimestampMs = Date.parse("2026-04-01T10:00:00.000Z");
+
+    await fs.ensureDir(sourcePath);
+    await fs.writeFile(sourceFilePath, "payload", "utf8");
+    await fs.utimes(sourceFilePath, baseTimestampMs / 1000, baseTimestampMs / 1000);
+
+    const runtime = await createRuntime({
+        name: "filesystem-analysis-tolerance",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        await fs.ensureDir(destinationPath);
+        await fs.writeFile(destinationFilePath, "payload", "utf8");
+        await fs.utimes(destinationFilePath, baseTimestampMs / 1000, (baseTimestampMs + 10) / 1000);
+
+        const analysis = await analyzeRuntime(runtime);
+        const destinationAnalysis = analysis.destinationAnalyses[0];
+
+        assert.equal(destinationAnalysis.outdatedFileCount, 0);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("analyzeRuntime keeps destination files beyond the timestamp tolerance as outdated", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+    const destinationFilePath = path.join(destinationPath, "keep.txt");
+    const baseTimestampMs = Date.parse("2026-04-01T10:00:00.000Z");
+
+    await fs.ensureDir(sourcePath);
+    await fs.writeFile(sourceFilePath, "payload", "utf8");
+    await fs.utimes(sourceFilePath, baseTimestampMs / 1000, baseTimestampMs / 1000);
+
+    const runtime = await createRuntime({
+        name: "filesystem-analysis-outdated",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        await fs.ensureDir(destinationPath);
+        await fs.writeFile(destinationFilePath, "payload", "utf8");
+        await fs.utimes(destinationFilePath, baseTimestampMs / 1000, (baseTimestampMs + 11) / 1000);
+
+        const analysis = await analyzeRuntime(runtime);
+        const destinationAnalysis = analysis.destinationAnalyses[0];
+
+        assert.equal(destinationAnalysis.outdatedFileCount, 1);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("analyzeRuntime treats same-sized files within the timestamp tolerance as current even when content differs", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+    const destinationFilePath = path.join(destinationPath, "keep.txt");
+    const baseTimestampMs = Date.parse("2026-04-01T10:00:00.000Z");
+
+    await fs.ensureDir(sourcePath);
+    await fs.writeFile(sourceFilePath, "abc", "utf8");
+    await fs.utimes(sourceFilePath, baseTimestampMs / 1000, baseTimestampMs / 1000);
+
+    const runtime = await createRuntime({
+        name: "filesystem-analysis-content-mismatch",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        await fs.ensureDir(destinationPath);
+        await fs.writeFile(destinationFilePath, "xyz", "utf8");
+        await fs.utimes(destinationFilePath, baseTimestampMs / 1000, (baseTimestampMs + 10) / 1000);
+
+        const analysis = await analyzeRuntime(runtime);
+        const destinationAnalysis = analysis.destinationAnalyses[0];
+
+        assert.equal(destinationAnalysis.outdatedFileCount, 0);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
 test("runFullSync prunes stale content inside .app directories", async () => {
     const tempDirectory = await createTempDirectory();
     const sourcePath = path.join(tempDirectory, "source");
     const destinationPath = path.join(tempDirectory, "destination");
     const sourceInfoPlistPath = path.join(sourcePath, "Sample.app", "Contents", "Info.plist");
     const sourceBinaryPath = path.join(sourcePath, "Sample.app", "Contents", "MacOS", "sample");
+    const sourceTimestamp = new Date("2026-04-01T10:00:00.000Z");
+    const staleDestinationTimestamp = new Date("2026-03-31T10:00:00.000Z");
 
     await fs.ensureDir(path.dirname(sourceInfoPlistPath));
     await fs.ensureDir(path.dirname(sourceBinaryPath));
     await fs.writeFile(sourceInfoPlistPath, "new-info", "utf8");
     await fs.writeFile(sourceBinaryPath, "binary", "utf8");
+    await fs.utimes(sourceInfoPlistPath, sourceTimestamp, sourceTimestamp);
 
     await fs.ensureDir(path.join(destinationPath, "Sample.app", "Contents", "Resources"));
     await fs.ensureDir(path.join(destinationPath, "Legacy.app", "Contents"));
     await fs.writeFile(path.join(destinationPath, "Sample.app", "Contents", "Info.plist"), "old-info", "utf8");
     await fs.writeFile(path.join(destinationPath, "Sample.app", "Contents", "Resources", "stale.txt"), "stale", "utf8");
     await fs.writeFile(path.join(destinationPath, "Legacy.app", "Contents", "Info.plist"), "legacy", "utf8");
+    await fs.utimes(path.join(destinationPath, "Sample.app", "Contents", "Info.plist"), staleDestinationTimestamp, staleDestinationTimestamp);
 
     const runtime = await createRuntime({
         name: "prune-app-package",
