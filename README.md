@@ -299,6 +299,8 @@ If you want to edit the template used to generate it, start from [launch-agent.t
 
 For `launchd`, prefer absolute paths and do not rely on the shell `PATH`. The generated agent calls `node` directly with the globally installed `~/fmirror/fmirror.js` bundle and the generated `source/.fmirror/config.json`.
 
+For large trees on macOS, the generated LaunchAgent raises `NumberOfFiles` to `200000` so the watcher does not inherit the default low `launchd` open-files limit.
+
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -322,6 +324,18 @@ For `launchd`, prefer absolute paths and do not rely on the shell `PATH`. The ge
 
     <key>KeepAlive</key>
     <true/>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>200000</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>200000</integer>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>/absolute/path/to/source/.fmirror/launchd.log</string>

@@ -208,6 +208,16 @@ async function createTemplateDirectory(rootPath: string): Promise<string> {
         "        <string>{{BUNDLE_PATH}}</string>",
         "        <string>{{CONFIG_PATH}}</string>",
         "    </array>",
+        "    <key>SoftResourceLimits</key>",
+        "    <dict>",
+        "        <key>NumberOfFiles</key>",
+        "        <integer>200000</integer>",
+        "    </dict>",
+        "    <key>HardResourceLimits</key>",
+        "    <dict>",
+        "        <key>NumberOfFiles</key>",
+        "        <integer>200000</integer>",
+        "    </dict>",
         "    <key>StandardOutPath</key>",
         "    <string>{{STANDARD_OUT_PATH}}</string>",
         "    <key>StandardErrorPath</key>",
@@ -1340,6 +1350,9 @@ test("setupMirror creates config, preserves existing ignore rules, and registers
     assert.match(installedPlistContent, /com\.fmirror\.my-project/);
     assert.match(installedPlistContent, /\/usr\/local\/bin\/node/);
     assert.match(installedPlistContent, new RegExp(installPaths.installedBundlePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(installedPlistContent, /<key>SoftResourceLimits<\/key>/);
+    assert.match(installedPlistContent, /<key>HardResourceLimits<\/key>/);
+    assert.match(installedPlistContent, /<integer>200000<\/integer>/);
     assert.equal((await fs.lstat(installPaths.launchAgentSymlinkPath)).isSymbolicLink(), true);
     assert.equal(path.resolve(path.dirname(installPaths.launchAgentSymlinkPath), await fs.readlink(installPaths.launchAgentSymlinkPath)), installPaths.launchAgentPath);
     assert.deepEqual(executedCommands, [
