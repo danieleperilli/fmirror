@@ -45,6 +45,7 @@ __azurite_db_table_extent__.json
 # Temporary files
 **/_tmp
 **/.tmp
+**/*.tmp
 
 # GIT 
 # Bootstrap copy - it can be rebuilt with:
