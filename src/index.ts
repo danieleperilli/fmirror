@@ -182,7 +182,7 @@ async function main(argv: string[] = process.argv): Promise<void> {
 
     for (const runtime of runtimes) {
         if (cliArguments.fastStart) {
-            log(`[${runtime.config.name}] Fast start enabled. Skipping initial sync.`);
+            log(`Fast start enabled. Skipping initial sync.`);
         } else {
             await runInitialSync(runtime);
         }
@@ -560,7 +560,7 @@ async function reloadIgnoreFiles(runtime: IJobRuntime): Promise<void> {
     await collectIgnoreFiles(runtime, runtime.config.source, ignoreFiles);
     ignoreFiles.sort((left, right) => left.directory.length - right.directory.length);
     runtime.ignoreFiles = ignoreFiles;
-    log(`[${runtime.config.name}] Loaded ${ignoreFiles.length} ${IGNORE_FILE_NAME} file(s).`);
+    log(`Loaded ${ignoreFiles.length} ${IGNORE_FILE_NAME} file(s).`);
 }
 
 /**
@@ -663,7 +663,7 @@ async function runInitialSync(runtime: IJobRuntime): Promise<void> {
  * @param label Log label describing the sync phase being executed.
  */
 async function runFullSync(runtime: IJobRuntime, label: string): Promise<void> {
-    log(`[${runtime.config.name}] ${label} started.`);
+    log(`${label} started.`);
 
     try {
         await visitSourceDirectories(runtime, runtime.config.source, async (absoluteDirectoryPath) => {
@@ -682,7 +682,7 @@ async function runFullSync(runtime: IJobRuntime, label: string): Promise<void> {
         throw error;
     }
 
-    log(`[${runtime.config.name}] ${label} completed.`);
+    log(`${label} completed.`);
 }
 
 /**
@@ -712,7 +712,7 @@ async function analyzeRuntimes(runtimes: IJobRuntime[]): Promise<void> {
         totalFileCount += analysis.fileCount;
         totalSizeBytes += analysis.totalSizeBytes;
 
-        log(`[${runtime.config.name}] Analysis completed: ${analysis.fileCount} file(s), ${analysis.totalSizeBytes} bytes (${formatBytes(analysis.totalSizeBytes)}). Log: ${analysis.logPath}`);
+        log(`Analysis completed: ${analysis.fileCount} file(s), ${analysis.totalSizeBytes} bytes (${formatBytes(analysis.totalSizeBytes)}). Log: ${analysis.logPath}`);
     }
 
     log(`Analysis summary: ${totalFileCount} file(s), ${totalSizeBytes} bytes (${formatBytes(totalSizeBytes)}).`);
@@ -1777,7 +1777,7 @@ async function pruneDestination(runtime: IJobRuntime, destinationRoot: string, c
             }
 
             await fs.remove(absoluteEntryPath);
-            log(`[${runtime.config.name}] Deleted stale directory ${relativePath}`);
+            log(`Deleted stale directory ${relativePath}`);
             continue;
         }
 
@@ -1786,7 +1786,7 @@ async function pruneDestination(runtime: IJobRuntime, destinationRoot: string, c
         }
 
         await fs.remove(absoluteEntryPath);
-        log(`[${runtime.config.name}] Deleted stale file ${relativePath}`);
+        log(`Deleted stale file ${relativePath}`);
     }
 }
 
@@ -1807,7 +1807,7 @@ async function startWatcher(runtime: IJobRuntime, debounceMs: number): Promise<b
         return false;
     }
 
-    log(`[${runtime.config.name}] Watcher ready.`);
+    log(`Watcher ready.`);
     return true;
 }
 
@@ -1852,7 +1852,7 @@ async function handleWatcherStartupError(runtime: IJobRuntime, watcher: IWatchSe
     }
 
     await appendOperationalErrorLog(runtime, "watcher", runtime.config.source, error);
-    log(`[${runtime.config.name}] Watcher start failed: ${formatWatcherErrorMessage(error)}`);
+    log(`Watcher start failed: ${formatWatcherErrorMessage(error)}`);
 }
 
 /**
@@ -1872,7 +1872,7 @@ async function handleWatcherRuntimeError(runtime: IJobRuntime, watcher: IWatchSe
     }
 
     await appendOperationalErrorLog(runtime, "watcher", runtime.config.source, error);
-    log(`[${runtime.config.name}] Watcher error: ${formatWatcherErrorMessage(error)}`);
+    log(`Watcher error: ${formatWatcherErrorMessage(error)}`);
 }
 
 /**
@@ -2140,7 +2140,7 @@ async function handleWatchmanFileNotification(runtime: IJobRuntime, changedFile:
     }
 
     if (path.basename(absolutePath) === IGNORE_FILE_NAME && !isOperationalPath(runtime.config.source, absolutePath)) {
-        log(`[${runtime.config.name}] ${IGNORE_FILE_NAME} changed. Reloading rules.`);
+        log(`${IGNORE_FILE_NAME} changed. Reloading rules.`);
         queueRuntimeFullSync(runtime, debounceMs, "Ignore rules changed.", true);
         return;
     }
@@ -2406,7 +2406,7 @@ async function replayRecoveredQueue(runtime: IJobRuntime): Promise<void> {
         return;
     }
 
-    log(`[${runtime.config.name}] Replaying ${runtime.recoveredQueuePaths.length} queued file event(s) from disk.`);
+    log(`Replaying ${runtime.recoveredQueuePaths.length} queued file event(s) from disk.`);
 
     for (const recoveredQueuePath of runtime.recoveredQueuePaths) {
         if (!runtime.queuedFileEvents.has(recoveredQueuePath)) {
@@ -2506,7 +2506,7 @@ async function flushQueuedFileEvent(runtime: IJobRuntime, absolutePath: string):
         if (!wasSuccessful) {
             const retryDelayMs = getRetryDelayMs(latestQueuedEvent.retryCount, runtime.fileEventDebounceMs);
             await appendOperationalErrorLog(runtime, `file ${eventName}`, absolutePath, flushError);
-            log(`[${runtime.config.name}] ${eventName} failed for ${absolutePath}: ${formatError(flushError)}. Retrying in ${retryDelayMs}ms.`);
+            log(`${eventName} failed for ${absolutePath}: ${formatError(flushError)}. Retrying in ${retryDelayMs}ms.`);
 
             if (!latestQueuedEvent.retryTimer) {
                 latestQueuedEvent.retryTimer = setTimeout(() => {
@@ -2611,7 +2611,7 @@ async function handleDirectoryEvent(runtime: IJobRuntime, dirPath: string, event
         }
     } catch (error) {
         await appendOperationalErrorLog(runtime, `directory ${eventName}`, absolutePath, error);
-        log(`[${runtime.config.name}] ${eventName} failed for ${absolutePath}: ${formatError(error)}`);
+        log(`${eventName} failed for ${absolutePath}: ${formatError(error)}`);
     }
 }
 
@@ -2642,7 +2642,7 @@ async function syncDirectory(runtime: IJobRuntime, absoluteDirectoryPath: string
     }
 
     /*if (createdDestinationCount > 0) {
-        log(`[${runtime.config.name}] Synced directory ${relativePath} to ${createdDestinationCount} destination(s).`);
+        log(`Synced directory ${relativePath} to ${createdDestinationCount} destination(s).`);
     }*/
 }
 
@@ -2685,7 +2685,7 @@ async function syncFile(runtime: IJobRuntime, absoluteFilePath: string, sourceFi
 
     /*
     if (copiedDestinationCount > 0) {
-        log(`[${runtime.config.name}] Synced ${relativePath}`);
+        log(`Synced ${relativePath}`);
     }*/
 }
 
@@ -2787,7 +2787,7 @@ async function deletePathFromDestinations(runtime: IJobRuntime, absolutePath: st
     }
 
     const label = sourceEntryType ?? "path";
-    log(`[${runtime.config.name}] Deleted ${label} ${relativePath}`);
+    log(`Deleted ${label} ${relativePath}`);
 }
 
 /**
@@ -2819,13 +2819,13 @@ async function ensureOperationalStateDirectory(runtime: IJobRuntime): Promise<vo
  * @param error Error value thrown by the runtime.
  */
 async function appendOperationalErrorLog(runtime: IJobRuntime, scope: string, targetPath: string, error: unknown): Promise<void> {
-    const entry = `${new Date().toISOString()} [${runtime.config.name}] ${scope} ${targetPath}: ${formatError(error)}\n`;
+    const entry = `[${new Date().toISOString()}] ${scope} ${targetPath}: ${formatError(error)}\n`;
 
     try {
         await ensureOperationalStateDirectory(runtime);
         await fs.appendFile(runtime.errorLogPath, entry, "utf8");
     } catch (writeError) {
-        console.error(`${new Date().toISOString()} [${runtime.config.name}] Failed to write ${runtime.errorLogPath}: ${formatError(writeError)}`);
+        console.error(`[${new Date().toISOString()}] Failed to write ${runtime.errorLogPath}: ${formatError(writeError)}`);
     }
 }
 
@@ -3272,14 +3272,14 @@ function queueRuntimeFullSync(runtime: IJobRuntime, debounceMs: number, reason: 
                 await reloadIgnoreFiles(runtime);
             }
 
-            log(`[${runtime.config.name}] ${reason} Running reconciliation.`);
+            log(`${reason} Running reconciliation.`);
             startedFullSync = true;
             await runFullSync(runtime, "Full sync");
         } catch (error) {
             if (!startedFullSync) {
                 await appendOperationalErrorLog(runtime, "full sync", runtime.config.source, error);
             }
-            log(`[${runtime.config.name}] Full sync failed: ${formatError(error)}`);
+            log(`Full sync failed: ${formatError(error)}`);
         }
     }, debounceMs);
 }
@@ -3318,7 +3318,7 @@ function formatBytes(sizeBytes: number): string {
  */
 function log(message: string): void {
     const timestamp = new Date().toISOString();
-    console.log(`${timestamp} ${message}`);
+    console.log(`[${timestamp}] ${message}`);
 }
 
 /**

@@ -61,67 +61,31 @@ The file `.fmirror/queue.json` stores the in-memory file queue on disk so pendin
 
 ### Watchman
 
-Watch mode requires Watchman.
+fmirror requires Watchman.
 
 See the official Watchman installation guide for platform-specific packages:
 
 - https://facebook.github.io/watchman/docs/install
 
-### Local project setup
-
-Clone or copy this project locally, then run:
+### fmirror
 
 ```bash
 npm install
-npm run build
-cp templates/config.template.json fmirror.config.json
-```
-
-Edit `fmirror.config.json` and then start the watcher:
-
-```bash
-npm start
-```
-
-Watch mode requires Watchman. See the [Watchman](https://facebook.github.io/watchman/docs/install) section above for installation details and the `FMIRROR_WATCHMAN_PATH` note.
-
-For development mode:
-
-```bash
-npm run dev
-```
-
-`npm run build` produces `dist/fmirror.js`.
-
-`npm start` and `npm run dev` pass `./fmirror.config.json` explicitly.
-
-If you run `node dist/fmirror.js` without arguments, the app looks for `fmirror.config.json` in the same folder as `dist/fmirror.js`.
-
-### Mirror installation
-
-```bash
-npm install
-npm run build
 npm run install:local
 ```
 
 This command:
 
+- build fmirror
 - copies the built bundle to `~/fmirror/fmirror.js`
 - creates the launcher `~/fmirror/fmirror`
 - copies the install templates to `~/fmirror/templates`
 - appends `~/fmirror` to your shell `PATH` if needed
 
-After that, set up a mirror:
+After that (and reloading your shell), set up a mirror:
 
 ```bash
 fmirror setup -s /absolute/path/to/source -d /absolute/path/to/destination
-```
-
-Or, before reloading your shell:
-
-```bash
-~/fmirror/fmirror setup -s /absolute/path/to/source -d /absolute/path/to/destination
 ```
 
 The `setup` command:
@@ -335,18 +299,6 @@ For large trees on macOS, the generated LaunchAgent raises `NumberOfFiles` to `2
 
     <key>KeepAlive</key>
     <true/>
-
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>200000</integer>
-    </dict>
-
-    <key>HardResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>200000</integer>
-    </dict>
 
     <key>StandardOutPath</key>
     <string>/absolute/path/to/source/.fmirror/launchd.log</string>
