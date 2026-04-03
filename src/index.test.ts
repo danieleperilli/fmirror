@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import fs from "fs-extra";
 import type { IJobRuntime } from "./interfaces";
-import { analyzeRuntime, buildWatchmanSubscribeCommand, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, getConfigPath, handleDirectoryEvent, handleFileEvent, installGlobalCli, isWatcherLimitError, normalizeWatchmanEntryType, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, renderInstallConfigContent, renderLaunchAgentTemplate, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, syncFile } from "./index";
+import { analyzeRuntime, buildWatchmanSubscribeCommand, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, getConfigPath, handleDirectoryEvent, handleFileEvent, installGlobalCli, isWatcherLimitError, normalizeWatchmanEntryType, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, reconcileRuntimes, renderInstallConfigContent, renderLaunchAgentTemplate, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, syncFile } from "./index";
 
 test("getConfigPath prefers the CLI argument", async () => {
     const resolvedPath = getConfigPath([
@@ -268,6 +268,28 @@ async function createTemplateDirectory(rootPath: string): Promise<string> {
 }
 
 /**
+ * Captures console.log output emitted while the provided callback runs.
+ *
+ * @param callback Async operation executed while console.log is intercepted.
+ */
+async function captureConsoleLogs(callback: () => Promise<void>): Promise<string[]> {
+    const originalConsoleLog = console.log;
+    const capturedLogs: string[] = [];
+
+    console.log = (...args: unknown[]): void => {
+        capturedLogs.push(args.map((arg) => String(arg)).join(" "));
+    };
+
+    try {
+        await callback();
+    } finally {
+        console.log = originalConsoleLog;
+    }
+
+    return capturedLogs;
+}
+
+/**
  * Polls until the provided predicate becomes true or the timeout elapses.
  *
  * @param predicate Async predicate that determines completion.
@@ -474,6 +496,120 @@ test("runFullSync skips source files that disappear during source scanning", asy
         assert.equal(await fs.pathExists(path.join(destinationPath, "transient.txt")), false);
     } finally {
         mutableFs.stat = originalStat;
+        await disposeRuntime(runtime);
+    }
+});
+
+test("runFullSync logs sync entries outside reconcile", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "nested", "file.txt");
+
+    await fs.ensureDir(path.dirname(sourceFilePath));
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(sourceFilePath, "payload", "utf8");
+
+    const runtime = await createRuntime({
+        name: "truncated-sync-log",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await runFullSync(runtime, "Initial sync");
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
+
+        assert.equal(normalizedLogs.includes("Synced directory nested to 1 destination(s)."), true);
+        assert.equal(normalizedLogs.includes("Synced nested/file.txt"), true);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("sync logs trim launchd.log when it grows beyond the size limit", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+    const launchdLogPath = path.join(sourcePath, ".fmirror", "launchd.log");
+    const oversizedLogContent = `${"[head-marker]\n"}${"x".repeat(6 * 1024 * 1024)}\n[tail-marker]\n`;
+
+    await fs.ensureDir(sourcePath);
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(sourceFilePath, "payload", "utf8");
+
+    const runtime = await createRuntime({
+        name: "trim-launchd-log",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        await fs.writeFile(launchdLogPath, oversizedLogContent, "utf8");
+        await new Promise<void>((resolve) => {
+            setTimeout(resolve, 1100);
+        });
+        await syncFile(runtime, sourceFilePath);
+
+        await waitForCondition(async () => {
+            const launchdLogStats = await fs.stat(launchdLogPath);
+            return launchdLogStats.size < Buffer.byteLength(oversizedLogContent, "utf8");
+        }, 2000);
+
+        const trimmedLogContent = await fs.readFile(launchdLogPath, "utf8");
+        assert.equal(trimmedLogContent.includes("launchd.log truncated after exceeding"), true);
+        assert.equal(trimmedLogContent.includes("[tail-marker]"), true);
+        assert.equal(trimmedLogContent.includes("[head-marker]"), false);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("reconcileRuntimes suppresses per-entry sync logs", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "docs", "readme.txt");
+
+    await fs.ensureDir(path.dirname(sourceFilePath));
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(sourceFilePath, "docs", "utf8");
+
+    const runtime = await createRuntime({
+        name: "silent-reconcile-log",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await reconcileRuntimes([
+                runtime
+            ]);
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
+
+        assert.equal(await fs.readFile(path.join(destinationPath, "docs", "readme.txt"), "utf8"), "docs");
+        assert.equal(normalizedLogs.some((entry) => entry.startsWith("Synced ")), false);
+        assert.equal(normalizedLogs.includes("Manual reconciliation started."), true);
+        assert.equal(normalizedLogs.includes("Manual reconciliation completed."), true);
+        assert.equal(normalizedLogs.includes("Reconciled 1 job(s)."), true);
+    } finally {
         await disposeRuntime(runtime);
     }
 });

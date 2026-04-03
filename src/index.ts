@@ -9,6 +9,7 @@
 import { execFile, spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Stats } from "node:fs";
+import { open } from "node:fs/promises";
 import fs from "fs-extra";
 import path from "node:path";
 import os from "node:os";
@@ -31,6 +32,9 @@ const FILE_EVENT_BURST_THRESHOLD = 20;
 const WATCHER_ERROR_LOG_WINDOW_MS = 30000;
 const WATCHER_LIMIT_ERROR_LOG_WINDOW_MS = 300000;
 const FILE_STATE_MTIME_TOLERANCE_MS = 10;
+const MAX_MANAGED_STDOUT_LOG_SIZE_BYTES = 5 * 1024 * 1024;
+const RETAINED_MANAGED_STDOUT_LOG_SIZE_BYTES = 2 * 1024 * 1024;
+const MANAGED_STDOUT_LOG_MAINTENANCE_WINDOW_MS = 1000;
 const INSTALL_DIRECTORY_NAME = "fmirror";
 const INSTALL_EXECUTABLE_FILE_NAME = "fmirror";
 const INSTALL_BUNDLE_FILE_NAME = "fmirror.js";
@@ -56,11 +60,18 @@ const WATCHMAN_COMMAND_ARGUMENTS = [
 
 const execFileAsync = promisify(execFile);
 let cachedWatchmanExecutablePath: string | undefined;
+const managedStdoutLogPaths = new Set<string>();
+let managedStdoutLogMaintenancePromise: Promise<void> = Promise.resolve();
+let lastManagedStdoutLogMaintenanceAtMs = 0;
 
 interface ISourceFileVisit {
     absolutePath: string;
     relativePath: string;
     fileState: IFileState;
+}
+
+interface IRunFullSyncOptions {
+    shouldLogSyncedEntries?: boolean;
 }
 
 type SourceEntryType = "file" | "directory";
@@ -531,6 +542,7 @@ async function createRuntime(job: IJobConfig, fileEventDebounceMs: number): Prom
         queuePersistencePromise: Promise.resolve()
     };
 
+    registerManagedStdoutLogPath(path.join(internalAppDirectory, LAUNCH_AGENT_LOG_FILE_NAME));
     await ensureOperationalStateDirectory(runtime);
     const recoveredQueueItems = await readPersistedQueue(runtime);
 
@@ -661,17 +673,19 @@ async function runInitialSync(runtime: IJobRuntime): Promise<void> {
  *
  * @param runtime Runtime state for the current job.
  * @param label Log label describing the sync phase being executed.
+ * @param options Optional controls for the sync pass.
  */
-async function runFullSync(runtime: IJobRuntime, label: string): Promise<void> {
+async function runFullSync(runtime: IJobRuntime, label: string, options: IRunFullSyncOptions = {}): Promise<void> {
+    const shouldLogSyncedEntries = options.shouldLogSyncedEntries ?? true;
     log(`${label} started.`);
 
     try {
         await visitSourceDirectories(runtime, runtime.config.source, async (absoluteDirectoryPath) => {
-            await syncDirectory(runtime, absoluteDirectoryPath);
+            await syncDirectory(runtime, absoluteDirectoryPath, shouldLogSyncedEntries);
         });
 
         await visitSourceFiles(runtime, runtime.config.source, async (sourceFile) => {
-            await syncFile(runtime, sourceFile.absolutePath, sourceFile.fileState, true);
+            await syncFile(runtime, sourceFile.absolutePath, sourceFile.fileState, true, shouldLogSyncedEntries);
         });
 
         if (runtime.config.deleteMissing) {
@@ -692,7 +706,9 @@ async function runFullSync(runtime: IJobRuntime, label: string): Promise<void> {
  */
 async function reconcileRuntimes(runtimes: IJobRuntime[]): Promise<void> {
     for (const runtime of runtimes) {
-        await runFullSync(runtime, "Manual reconciliation");
+        await runFullSync(runtime, "Manual reconciliation", {
+            shouldLogSyncedEntries: false
+        });
     }
 
     log(`Reconciled ${runtimes.length} job(s).`);
@@ -2620,8 +2636,9 @@ async function handleDirectoryEvent(runtime: IJobRuntime, dirPath: string, event
  *
  * @param runtime Runtime state for the current job.
  * @param absoluteDirectoryPath Absolute path of the source directory to mirror.
+ * @param shouldLogSyncOperation When true, logs the mirrored directory when something changed.
  */
-async function syncDirectory(runtime: IJobRuntime, absoluteDirectoryPath: string): Promise<void> {
+async function syncDirectory(runtime: IJobRuntime, absoluteDirectoryPath: string, shouldLogSyncOperation: boolean = true): Promise<void> {
     const relativePath = getRelativePathFromSource(runtime.config.source, absoluteDirectoryPath);
     let createdDestinationCount = 0;
 
@@ -2641,9 +2658,9 @@ async function syncDirectory(runtime: IJobRuntime, absoluteDirectoryPath: string
         createdDestinationCount += 1;
     }
 
-    /*if (createdDestinationCount > 0) {
+    if (shouldLogSyncOperation && createdDestinationCount > 0) {
         log(`Synced directory ${relativePath} to ${createdDestinationCount} destination(s).`);
-    }*/
+    }
 }
 
 /**
@@ -2653,8 +2670,9 @@ async function syncDirectory(runtime: IJobRuntime, absoluteDirectoryPath: string
  * @param absoluteFilePath Absolute path of the source file to sync.
  * @param sourceFileState Optional source metadata already computed during a full reconciliation.
  * @param shouldSkipEquivalentDestinations When true, destinations deemed equivalent are left untouched.
+ * @param shouldLogSyncOperation When true, logs the mirrored file when something changed.
  */
-async function syncFile(runtime: IJobRuntime, absoluteFilePath: string, sourceFileState?: IFileState, shouldSkipEquivalentDestinations: boolean = false): Promise<void> {
+async function syncFile(runtime: IJobRuntime, absoluteFilePath: string, sourceFileState?: IFileState, shouldSkipEquivalentDestinations: boolean = false, shouldLogSyncOperation: boolean = true): Promise<void> {
     const relativePath = getRelativePathFromSource(runtime.config.source, absoluteFilePath);
     let effectiveSourceFileState = sourceFileState;
     let copiedDestinationCount = 0;
@@ -2683,10 +2701,9 @@ async function syncFile(runtime: IJobRuntime, absoluteFilePath: string, sourceFi
         copiedDestinationCount += 1;
     }
 
-    /*
-    if (copiedDestinationCount > 0) {
+    if (shouldLogSyncOperation && copiedDestinationCount > 0) {
         log(`Synced ${relativePath}`);
-    }*/
+    }
 }
 
 /**
@@ -3319,6 +3336,82 @@ function formatBytes(sizeBytes: number): string {
 function log(message: string): void {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] ${message}`);
+    scheduleManagedStdoutLogMaintenance();
+}
+
+/**
+ * Registers a stdout log path that should be trimmed when it grows too large.
+ *
+ * @param logPath Absolute path of the managed stdout log file.
+ */
+function registerManagedStdoutLogPath(logPath: string): void {
+    managedStdoutLogPaths.add(logPath);
+}
+
+/**
+ * Schedules maintenance for managed stdout log files so they do not grow without bounds.
+ */
+function scheduleManagedStdoutLogMaintenance(): void {
+    if (managedStdoutLogPaths.size === 0) {
+        return;
+    }
+
+    const now = Date.now();
+    if (now - lastManagedStdoutLogMaintenanceAtMs < MANAGED_STDOUT_LOG_MAINTENANCE_WINDOW_MS) {
+        return;
+    }
+
+    lastManagedStdoutLogMaintenanceAtMs = now;
+    managedStdoutLogMaintenancePromise = managedStdoutLogMaintenancePromise
+        .then(async () => {
+            for (const logPath of managedStdoutLogPaths) {
+                await trimManagedStdoutLogFile(logPath);
+            }
+        })
+        .catch((error) => {
+            console.error(`[${new Date().toISOString()}] Failed to maintain managed stdout logs: ${formatError(error)}`);
+        });
+}
+
+/**
+ * Keeps only the most recent portion of a managed stdout log when it exceeds the configured size limit.
+ *
+ * @param logPath Absolute path of the managed stdout log file.
+ */
+async function trimManagedStdoutLogFile(logPath: string): Promise<void> {
+    let logStats: Stats;
+
+    try {
+        logStats = await fs.stat(logPath);
+    } catch (error) {
+        if (isMissingPathError(error)) {
+            return;
+        }
+
+        throw error;
+    }
+
+    if (!logStats.isFile() || logStats.size <= MAX_MANAGED_STDOUT_LOG_SIZE_BYTES) {
+        return;
+    }
+
+    const bytesToRetain = Math.min(RETAINED_MANAGED_STDOUT_LOG_SIZE_BYTES, logStats.size);
+    const readOffset = logStats.size - bytesToRetain;
+    const fileHandle = await open(logPath, "r");
+    const retainedBuffer = Buffer.alloc(bytesToRetain);
+    let retainedContent = "";
+
+    try {
+        const { bytesRead } = await fileHandle.read(retainedBuffer, 0, bytesToRetain, readOffset);
+        retainedContent = retainedBuffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+        await fileHandle.close();
+    }
+
+    const firstLineBreakIndex = retainedContent.indexOf("\n");
+    const normalizedRetainedContent = firstLineBreakIndex >= 0 ? retainedContent.slice(firstLineBreakIndex + 1) : retainedContent;
+    const truncatedContent = `[${new Date().toISOString()}] launchd.log truncated after exceeding ${formatBytes(logStats.size)}.\n${normalizedRetainedContent}`;
+    await fs.writeFile(logPath, truncatedContent, "utf8");
 }
 
 /**
