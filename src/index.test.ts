@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import fs from "fs-extra";
 import type { IJobRuntime } from "./interfaces";
-import { analyzeRuntime, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, getConfigPath, handleDirectoryEvent, handleFileEvent, installGlobalCli, isWatcherLimitError, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, renderInstallConfigContent, renderLaunchAgentTemplate, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, syncFile } from "./index";
+import { analyzeRuntime, buildWatchmanSubscribeCommand, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, getConfigPath, handleDirectoryEvent, handleFileEvent, installGlobalCli, isWatcherLimitError, normalizeWatchmanEntryType, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, renderInstallConfigContent, renderLaunchAgentTemplate, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, syncFile } from "./index";
 
 test("getConfigPath prefers the CLI argument", async () => {
     const resolvedPath = getConfigPath([
@@ -160,6 +160,43 @@ test("shouldLogWatcherError groups watcher limit errors under one throttled mess
     assert.equal(shouldLogWatcherError(runtime, { code: "EMFILE", message: "too many open files" }), true);
     assert.equal(shouldLogWatcherError(runtime, { code: "ENOSPC", message: "system limit for number of file watchers reached" }), false);
     assert.equal(runtime.watcherErrorState?.suppressedCount, 1);
+});
+
+test("normalizeWatchmanEntryType maps Watchman type codes to mirrorable entry types", async () => {
+    assert.equal(normalizeWatchmanEntryType("d"), "directory");
+    assert.equal(normalizeWatchmanEntryType("f"), "file");
+    assert.equal(normalizeWatchmanEntryType("l"), "file");
+    assert.equal(normalizeWatchmanEntryType("x"), undefined);
+});
+
+test("buildWatchmanSubscribeCommand includes relative_root only when it is provided", async () => {
+    assert.deepEqual(buildWatchmanSubscribeCommand("/tmp/root", "fmirror-test", "c:1:2"), [
+        "subscribe",
+        "/tmp/root",
+        "fmirror-test",
+        {
+            fields: [
+                "name",
+                "exists",
+                "type"
+            ],
+            since: "c:1:2"
+        }
+    ]);
+    assert.deepEqual(buildWatchmanSubscribeCommand("/tmp/root", "fmirror-test", "c:1:2", "nested/project"), [
+        "subscribe",
+        "/tmp/root",
+        "fmirror-test",
+        {
+            fields: [
+                "name",
+                "exists",
+                "type"
+            ],
+            since: "c:1:2",
+            relative_root: "nested/project"
+        }
+    ]);
 });
 
 /**

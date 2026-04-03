@@ -26,16 +26,5 @@
 
     <key>StandardErrorPath</key>
     <string>{{STANDARD_ERROR_PATH}}</string>
-
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>200000</integer>
-    </dict>
-    <key>HardResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>200000</integer>
-    </dict>
 </dict>
 </plist>

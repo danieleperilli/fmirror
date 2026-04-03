@@ -1,6 +1,6 @@
 {
     "name": "fmirror",
-    "version": "0.7.0",
+    "version": "1.0.0",
     "private": true,
     "description": "Watch source folders and sync them to one or more destinations respecting .fmirror-ignore files.",
     "main": "dist/fmirror.js",
@@ -20,7 +20,6 @@
         "install:local": "npm run build && node dist/fmirror.js install"
     },
     "dependencies": {
-        "chokidar": "^4.0.3",
         "fs-extra": "^11.3.0",
         "ignore": "^7.0.5"
     },

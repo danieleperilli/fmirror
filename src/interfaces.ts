@@ -6,7 +6,6 @@
  * Copyright (c) 2026 Daniele Perilli
  */
 
-import type { FSWatcher } from "chokidar";
 import ignore from "ignore";
 
 export interface IAppConfig {
@@ -62,9 +61,13 @@ export interface IJobRuntime {
     queuePersistencePromise: Promise<void>;
     fileEventBurstCount: number;
     watcherErrorState?: IWatcherErrorState;
-    watcher?: FSWatcher;
+    watcher?: IWatchSession;
     fullSyncTimer?: NodeJS.Timeout;
     fileEventBurstTimer?: NodeJS.Timeout;
+}
+
+export interface IWatchSession {
+    close(): Promise<void>;
 }
 
 export interface INormalizedJobConfig {

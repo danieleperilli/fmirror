@@ -54,9 +54,18 @@ The file `.fmirror/queue.json` stores the in-memory file queue on disk so pendin
 ## Requirements
 
 - Node.js 22+
+- Watchman available on `PATH` for watch mode
 - macOS, Linux, or Windows
 
 ## Installation
+
+### Watchman
+
+Watch mode requires Watchman.
+
+See the official Watchman installation guide for platform-specific packages:
+
+- https://facebook.github.io/watchman/docs/install
 
 ### Local project setup
 
@@ -73,6 +82,8 @@ Edit `fmirror.config.json` and then start the watcher:
 ```bash
 npm start
 ```
+
+Watch mode requires Watchman. See the [Watchman](https://facebook.github.io/watchman/docs/install) section above for installation details and the `FMIRROR_WATCHMAN_PATH` note.
 
 For development mode:
 
@@ -364,7 +375,7 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.fmirror-source-fol
 - This tool mirrors files. It is not a bidirectional sync.
 - Destination changes are not copied back to the source.
 - If a `.fmirror-ignore` file changes, the app reloads ignore rules and performs a full reconciliation.
-- If the native watcher hits the system open-file limit, the app logs the watcher error and keeps those repeated limit errors throttled so the logs stay readable.
+- Watch mode uses Watchman as the only watcher backend and fails fast when the `watchman` command is not available.
 - Directory-level moves and structural changes schedule a reconciliation automatically, so rename and move operations converge to the final tree state even when raw watcher events are noisy.
 - Large bursts of file events also trigger a reconciliation fallback, which makes mass deletions and large refactors more reliable.
 - When `deleteMissing` is `true`, startup and ignore reloads also remove stale files from destinations so they match the current mirrored source state.

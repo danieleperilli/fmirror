@@ -6,16 +6,15 @@
  * Copyright (c) 2026 Daniele Perilli
  */
 
-import chokidar from "chokidar";
-import type { FSWatcher } from "chokidar";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Stats } from "node:fs";
 import fs from "fs-extra";
 import path from "node:path";
 import os from "node:os";
 import { promisify } from "node:util";
 import ignore from "ignore";
-import type { CliCommandName, FileEventName, IAppConfig, ICliArguments, IDestinationAnalysis, IFileState, IIgnoreFile, IJobConfig, IJobRuntime, IPersistedQueueItem, IPersistedQueueState, IQueuedFileEvent, IRuntimeAnalysis } from "./interfaces";
+import type { CliCommandName, FileEventName, IAppConfig, ICliArguments, IDestinationAnalysis, IFileState, IIgnoreFile, IJobConfig, IJobRuntime, IPersistedQueueItem, IPersistedQueueState, IQueuedFileEvent, IRuntimeAnalysis, IWatchSession } from "./interfaces";
 
 const DEFAULT_CONFIG_FILE_NAME = "fmirror.config.json";
 const IGNORE_FILE_NAME = ".fmirror-ignore";
@@ -45,8 +44,18 @@ const IGNORE_TEMPLATE_FILE_NAME = "fmirror-ignore.template";
 const LAUNCH_AGENT_TEMPLATE_FILE_NAME = "launch-agent.template.plist";
 const PATH_EXPORT_BLOCK_START = "# >>> fmirror >>>";
 const PATH_EXPORT_BLOCK_END = "# <<< fmirror <<<";
+const WATCHMAN_SUBSCRIPTION_NAME_PREFIX = "fmirror-";
+const WATCHMAN_SUBSCRIBE_TIMEOUT_MS = 10000;
+const WATCHMAN_BINARY_ENV_NAME = "FMIRROR_WATCHMAN_PATH";
+const WATCHMAN_COMMAND_ARGUMENTS = [
+    "-j",
+    "--server-encoding=json",
+    "--output-encoding=json",
+    "--no-pretty"
+];
 
 const execFileAsync = promisify(execFile);
+let cachedWatchmanExecutablePath: string | undefined;
 
 interface ISourceFileVisit {
     absolutePath: string;
@@ -90,6 +99,51 @@ interface IInstallPaths extends IGlobalInstallPaths {
     launchAgentSymlinkPath: string;
     launchAgentLogPath: string;
     launchAgentErrorLogPath: string;
+}
+
+interface IWatchmanWatchProjectResponse {
+    error?: string;
+    warning?: string;
+    watch: string;
+    relative_path?: string;
+}
+
+interface IWatchmanClockResponse {
+    error?: string;
+    warning?: string;
+    clock: string;
+}
+
+interface IWatchmanSubscribeResponse {
+    error?: string;
+    warning?: string;
+    subscribe: string;
+}
+
+interface IWatchmanSubscriptionFile {
+    name: string;
+    exists?: boolean;
+    type?: string;
+}
+
+interface IWatchmanSubscriptionNotification {
+    error?: string;
+    warning?: string;
+    subscription?: string;
+    is_fresh_instance?: boolean;
+    files?: IWatchmanSubscriptionFile[];
+}
+
+interface IWatchmanSubscriptionOptions {
+    fields: string[];
+    since: string;
+    relative_root?: string;
+}
+
+interface IWatchmanSession extends IWatchSession {
+    process: ChildProcessWithoutNullStreams;
+    subscriptionName: string;
+    isClosing: boolean;
 }
 
 /**
@@ -1743,108 +1797,38 @@ async function pruneDestination(runtime: IJobRuntime, destinationRoot: string, c
  * @param debounceMs Delay used to debounce full reloads after ignore file changes.
  */
 async function startWatcher(runtime: IJobRuntime, debounceMs: number): Promise<boolean> {
-    const watcher = createWatcher(runtime, debounceMs);
-    runtime.watcher = watcher;
+    let watcher: IWatchSession | undefined;
 
     try {
-        await waitForWatcherStartup(watcher);
+        watcher = await createWatcher(runtime, debounceMs);
+        runtime.watcher = watcher;
     } catch (error) {
         await handleWatcherStartupError(runtime, watcher, error);
         return false;
     }
-
-    watcher.on("error", (error: unknown) => {
-        void handleWatcherRuntimeError(runtime, watcher, error);
-    });
 
     log(`[${runtime.config.name}] Watcher ready.`);
     return true;
 }
 
 /**
- * Creates and wires a chokidar watcher instance for the current runtime.
+ * Creates and wires a Watchman subscription session for the current runtime.
  *
  * @param runtime Runtime state for the current job.
  * @param debounceMs Delay used to debounce full reloads after ignore file changes.
  */
-function createWatcher(runtime: IJobRuntime, debounceMs: number): FSWatcher {
-    const watcher = chokidar.watch(runtime.config.source, {
-        persistent: true,
-        ignoreInitial: true,
-        awaitWriteFinish: {
-            stabilityThreshold: 300,
-            pollInterval: 100
-        },
-        ignored: (watchPath: string) => {
-            const absolutePath = path.resolve(watchPath);
-
-            if (path.basename(absolutePath) === IGNORE_FILE_NAME && !isOperationalPath(runtime.config.source, absolutePath)) {
-                return false;
-            }
-
-            if (!runtime.config.watchHidden && isHiddenPath(runtime.config.source, absolutePath)) {
-                return true;
-            }
-
-            return isIgnored(runtime, absolutePath, isExistingDirectoryPath(absolutePath));
-        }
-    });
-
-    watcher.on("add", (filePath) => {
-        queueFileEvent(runtime, filePath, "add", debounceMs);
-    });
-
-    watcher.on("change", (filePath) => {
-        queueFileEvent(runtime, filePath, "change", debounceMs);
-    });
-
-    watcher.on("unlink", (filePath) => {
-        queueFileEvent(runtime, filePath, "unlink", debounceMs);
-    });
-
-    watcher.on("addDir", async (dirPath) => {
-        await handleDirectoryEvent(runtime, dirPath, "addDir", debounceMs);
-    });
-
-    watcher.on("unlinkDir", async (dirPath) => {
-        await handleDirectoryEvent(runtime, dirPath, "unlinkDir", debounceMs);
-    });
-
-    watcher.on("all", (_event, changedPath) => {
-        if (path.basename(changedPath) === IGNORE_FILE_NAME && !isOperationalPath(runtime.config.source, changedPath)) {
-            log(`[${runtime.config.name}] ${IGNORE_FILE_NAME} changed. Reloading rules.`);
-            queueRuntimeFullSync(runtime, debounceMs, "Ignore rules changed.", true);
-        }
-    });
-
-    return watcher;
-}
-
-/**
- * Waits for watcher startup and fails fast if chokidar cannot initialize the native watcher.
- *
- * @param watcher Watcher being started.
- */
-async function waitForWatcherStartup(watcher: FSWatcher): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-        const onReady = () => {
-            cleanup();
-            resolve();
-        };
-
-        const onError = (error: unknown) => {
-            cleanup();
-            reject(error);
-        };
-
-        const cleanup = () => {
-            watcher.off("ready", onReady);
-            watcher.off("error", onError);
-        };
-
-        watcher.once("ready", onReady);
-        watcher.on("error", onError);
-    });
+async function createWatcher(runtime: IJobRuntime, debounceMs: number): Promise<IWatchSession> {
+    const watchProjectResponse = await runWatchmanCommand<IWatchmanWatchProjectResponse>([
+        "watch-project",
+        runtime.config.source
+    ]);
+    const watchRoot = watchProjectResponse.watch;
+    const relativeRoot = watchProjectResponse.relative_path;
+    const clockResponse = await runWatchmanCommand<IWatchmanClockResponse>([
+        "clock",
+        watchRoot
+    ]);
+    return await createWatchmanSubscriptionSession(runtime, debounceMs, watchRoot, relativeRoot, clockResponse.clock);
 }
 
 /**
@@ -1852,14 +1836,16 @@ async function waitForWatcherStartup(watcher: FSWatcher): Promise<void> {
  *
  * @param runtime Runtime state for the current job.
  * @param watcher Watcher that failed during startup.
- * @param error Error raised by chokidar.
+ * @param error Error raised by Watchman startup.
  */
-async function handleWatcherStartupError(runtime: IJobRuntime, watcher: FSWatcher, error: unknown): Promise<void> {
-    if (runtime.watcher === watcher) {
+async function handleWatcherStartupError(runtime: IJobRuntime, watcher: IWatchSession | undefined, error: unknown): Promise<void> {
+    if (watcher && runtime.watcher === watcher) {
         runtime.watcher = undefined;
     }
 
-    await closeWatcherSafely(watcher);
+    if (watcher) {
+        await closeWatcherSafely(watcher);
+    }
 
     if (!shouldLogWatcherError(runtime, error)) {
         return;
@@ -1874,9 +1860,9 @@ async function handleWatcherStartupError(runtime: IJobRuntime, watcher: FSWatche
  *
  * @param runtime Runtime state for the current job.
  * @param watcher Watcher that raised the error.
- * @param error Error raised by chokidar.
+ * @param error Error raised by Watchman.
  */
-async function handleWatcherRuntimeError(runtime: IJobRuntime, watcher: FSWatcher, error: unknown): Promise<void> {
+async function handleWatcherRuntimeError(runtime: IJobRuntime, watcher: IWatchSession, error: unknown): Promise<void> {
     if (runtime.watcher !== watcher) {
         return;
     }
@@ -1894,7 +1880,7 @@ async function handleWatcherRuntimeError(runtime: IJobRuntime, watcher: FSWatche
  *
  * @param watcher Watcher instance to close.
  */
-async function closeWatcherSafely(watcher: FSWatcher): Promise<void> {
+async function closeWatcherSafely(watcher: IWatchSession): Promise<void> {
     try {
         await watcher.close();
     } catch {
@@ -1903,10 +1889,431 @@ async function closeWatcherSafely(watcher: FSWatcher): Promise<void> {
 }
 
 /**
+ * Executes a single Watchman JSON command and resolves the parsed response object.
+ *
+ * @param command Watchman command payload.
+ */
+async function runWatchmanCommand<TResponse extends { error?: string; warning?: string; }>(command: unknown[]): Promise<TResponse> {
+    const watchmanExecutablePath = await resolveWatchmanExecutablePath();
+
+    return await new Promise<TResponse>((resolve, reject) => {
+        const process = spawn(watchmanExecutablePath, WATCHMAN_COMMAND_ARGUMENTS, {
+            stdio: [
+                "pipe",
+                "pipe",
+                "pipe"
+            ]
+        });
+        let stdout = "";
+        let stderr = "";
+
+        process.stdout.setEncoding("utf8");
+        process.stderr.setEncoding("utf8");
+        process.stdout.on("data", (chunk: string) => {
+            stdout += chunk;
+        });
+        process.stderr.on("data", (chunk: string) => {
+            stderr += chunk;
+        });
+        process.once("error", (error: Error) => {
+            reject(createWatchmanCommandError(error, stderr));
+        });
+        process.once("close", (code) => {
+            if (code !== 0) {
+                reject(new Error(createWatchmanProcessFailureMessage(code, stderr, stdout)));
+                return;
+            }
+
+            try {
+                const response = JSON.parse(stdout.trim()) as TResponse;
+                if (response.warning) {
+                    log(`[watchman] ${response.warning}`);
+                }
+
+                if (response.error) {
+                    reject(new Error(response.error));
+                    return;
+                }
+
+                resolve(response);
+            } catch (error) {
+                reject(new Error(`Failed to parse Watchman response: ${formatError(error)}.`));
+            }
+        });
+
+        process.stdin.end(`${JSON.stringify(command)}\n`);
+    });
+}
+
+/**
+ * Creates the persistent Watchman client used to receive subscription notifications.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param debounceMs Delay used to debounce full reloads after ignore file changes.
+ * @param watchRoot Effective Watchman root returned by `watch-project`.
+ * @param relativeRoot Optional source-relative root inside the watched tree.
+ * @param sinceClock Clock captured immediately before the subscription starts.
+ */
+async function createWatchmanSubscriptionSession(runtime: IJobRuntime, debounceMs: number, watchRoot: string, relativeRoot: string | undefined, sinceClock: string): Promise<IWatchmanSession> {
+    const subscriptionName = createWatchmanSubscriptionName(runtime.config.name);
+    const watchmanExecutablePath = await resolveWatchmanExecutablePath();
+
+    return await new Promise<IWatchmanSession>((resolve, reject) => {
+        const process = spawn(watchmanExecutablePath, [
+            ...WATCHMAN_COMMAND_ARGUMENTS,
+            "-p"
+        ], {
+            stdio: [
+                "pipe",
+                "pipe",
+                "pipe"
+            ]
+        });
+        const session: IWatchmanSession = {
+            process,
+            subscriptionName,
+            isClosing: false,
+            close: async () => {
+                await closeWatchmanSession(session);
+            }
+        };
+        let stderr = "";
+        let stdoutBuffer = "";
+        let isSubscribed = false;
+        const subscribeTimeout = setTimeout(() => {
+            if (isSubscribed) {
+                return;
+            }
+
+            void closeWatchmanSession(session);
+            reject(new Error(`Timed out while waiting for Watchman subscription '${subscriptionName}' to start.`));
+        }, WATCHMAN_SUBSCRIBE_TIMEOUT_MS);
+
+        process.stdout.setEncoding("utf8");
+        process.stderr.setEncoding("utf8");
+        process.stderr.on("data", (chunk: string) => {
+            stderr += chunk;
+        });
+        process.once("error", (error: Error) => {
+            clearTimeout(subscribeTimeout);
+
+            if (!isSubscribed) {
+                reject(createWatchmanCommandError(error, stderr));
+                return;
+            }
+
+            if (!session.isClosing) {
+                void handleWatcherRuntimeError(runtime, session, createWatchmanCommandError(error, stderr));
+            }
+        });
+        process.once("close", (code) => {
+            clearTimeout(subscribeTimeout);
+
+            if (!isSubscribed) {
+                reject(new Error(createWatchmanProcessFailureMessage(code, stderr, stdoutBuffer)));
+                return;
+            }
+
+            if (!session.isClosing) {
+                void handleWatcherRuntimeError(runtime, session, new Error(createWatchmanProcessFailureMessage(code, stderr, stdoutBuffer)));
+            }
+        });
+        process.stdout.on("data", (chunk: string) => {
+            stdoutBuffer += chunk;
+            const lines = stdoutBuffer.split("\n");
+            stdoutBuffer = lines.pop() ?? "";
+
+            for (const line of lines) {
+                if (!line.trim()) {
+                    continue;
+                }
+
+                let message: IWatchmanSubscribeResponse | IWatchmanSubscriptionNotification;
+
+                try {
+                    message = JSON.parse(line) as IWatchmanSubscribeResponse | IWatchmanSubscriptionNotification;
+                } catch (error) {
+                    const parseError = new Error(`Failed to parse Watchman subscription output: ${formatError(error)}.`);
+
+                    if (!isSubscribed) {
+                        clearTimeout(subscribeTimeout);
+                        reject(parseError);
+                        return;
+                    }
+
+                    if (!session.isClosing) {
+                        void handleWatcherRuntimeError(runtime, session, parseError);
+                    }
+                    return;
+                }
+
+                if ("warning" in message && message.warning) {
+                    log(`[watchman] ${message.warning}`);
+                }
+
+                if (!isSubscribed) {
+                    if ("error" in message && message.error) {
+                        clearTimeout(subscribeTimeout);
+                        void closeWatchmanSession(session);
+                        reject(new Error(message.error));
+                        return;
+                    }
+
+                    if ("subscribe" in message && message.subscribe === subscriptionName) {
+                        clearTimeout(subscribeTimeout);
+                        isSubscribed = true;
+                        resolve(session);
+                    }
+                    continue;
+                }
+
+                if ("subscription" in message && message.subscription === subscriptionName) {
+                    void handleWatchmanSubscriptionNotification(runtime, message, debounceMs).catch(async (error) => {
+                        await handleWatcherRuntimeError(runtime, session, error);
+                    });
+                }
+            }
+        });
+
+        process.stdin.write(`${JSON.stringify(buildWatchmanSubscribeCommand(watchRoot, subscriptionName, sinceClock, relativeRoot))}\n`);
+    });
+}
+
+/**
+ * Closes the persistent Watchman client session.
+ *
+ * @param watcher Watchman session to close.
+ */
+async function closeWatchmanSession(watcher: IWatchmanSession): Promise<void> {
+    watcher.isClosing = true;
+
+    if (!watcher.process.stdin.destroyed) {
+        watcher.process.stdin.end();
+    }
+
+    if (watcher.process.exitCode !== null) {
+        return;
+    }
+
+    await new Promise<void>((resolve) => {
+        watcher.process.once("close", () => {
+            resolve();
+        });
+        watcher.process.kill("SIGTERM");
+    });
+}
+
+/**
+ * Handles a Watchman subscription update by translating changed paths into the existing sync pipeline.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param notification Notification payload received from Watchman.
+ * @param debounceMs Delay used to debounce full reloads after ignore file changes.
+ */
+async function handleWatchmanSubscriptionNotification(runtime: IJobRuntime, notification: IWatchmanSubscriptionNotification, debounceMs: number): Promise<void> {
+    if (notification.error) {
+        throw new Error(notification.error);
+    }
+
+    if (notification.is_fresh_instance) {
+        queueRuntimeFullSync(runtime, debounceMs, "Watchman requested a full rescan.");
+        return;
+    }
+
+    for (const changedFile of notification.files ?? []) {
+        await handleWatchmanFileNotification(runtime, changedFile, debounceMs);
+    }
+}
+
+/**
+ * Maps a single Watchman file record to the corresponding sync action.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param changedFile File record received from Watchman.
+ * @param debounceMs Delay used to debounce full reloads after ignore file changes.
+ */
+async function handleWatchmanFileNotification(runtime: IJobRuntime, changedFile: IWatchmanSubscriptionFile, debounceMs: number): Promise<void> {
+    const absolutePath = path.resolve(runtime.config.source, changedFile.name);
+
+    if (!isPathInsideSource(runtime.config.source, absolutePath)) {
+        return;
+    }
+
+    if (path.basename(absolutePath) === IGNORE_FILE_NAME && !isOperationalPath(runtime.config.source, absolutePath)) {
+        log(`[${runtime.config.name}] ${IGNORE_FILE_NAME} changed. Reloading rules.`);
+        queueRuntimeFullSync(runtime, debounceMs, "Ignore rules changed.", true);
+        return;
+    }
+
+    if (isOperationalPath(runtime.config.source, absolutePath)) {
+        return;
+    }
+
+    if (changedFile.exists === false) {
+        if (runtime.config.deleteMissing) {
+            await deletePathFromDestinations(runtime, absolutePath);
+        }
+        return;
+    }
+
+    const sourceEntryType = normalizeWatchmanEntryType(changedFile.type) ?? await readMirrorableSourceEntryType(runtime, absolutePath);
+    if (!sourceEntryType) {
+        return;
+    }
+
+    if (sourceEntryType === "directory") {
+        await handleDirectoryEvent(runtime, absolutePath, "addDir", debounceMs);
+        return;
+    }
+
+    queueFileEvent(runtime, absolutePath, "change", debounceMs);
+}
+
+/**
+ * Builds the Watchman subscribe command used by the persistent client.
+ *
+ * @param watchRoot Effective root returned by `watch-project`.
+ * @param subscriptionName Subscription identifier scoped to the current job.
+ * @param sinceClock Clock value captured just before the subscription begins.
+ * @param relativeRoot Optional source-relative root inside the watch root.
+ */
+function buildWatchmanSubscribeCommand(watchRoot: string, subscriptionName: string, sinceClock: string, relativeRoot?: string): unknown[] {
+    const subscriptionOptions: IWatchmanSubscriptionOptions = {
+        fields: [
+            "name",
+            "exists",
+            "type"
+        ],
+        since: sinceClock
+    };
+
+    if (relativeRoot) {
+        subscriptionOptions.relative_root = relativeRoot;
+    }
+
+    return [
+        "subscribe",
+        watchRoot,
+        subscriptionName,
+        subscriptionOptions
+    ];
+}
+
+/**
+ * Creates the deterministic Watchman subscription name used for a runtime.
+ *
+ * @param jobName Job label from the config file.
+ */
+function createWatchmanSubscriptionName(jobName: string): string {
+    const normalizedName = jobName
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    return `${WATCHMAN_SUBSCRIPTION_NAME_PREFIX}${normalizedName || "watch"}`;
+}
+
+/**
+ * Normalizes Watchman entry type codes to the source-entry types used by the sync pipeline.
+ *
+ * @param entryType Type code received from Watchman.
+ */
+function normalizeWatchmanEntryType(entryType: string | undefined): SourceEntryType | undefined {
+    if (entryType === "d") {
+        return "directory";
+    }
+
+    if (entryType === "f" || entryType === "l") {
+        return "file";
+    }
+
+    return undefined;
+}
+
+/**
+ * Converts child-process failures into a stable Watchman startup/runtime error.
+ *
+ * @param error Process-level error raised while talking to Watchman.
+ * @param stderr Current stderr buffer associated with the failed process.
+ */
+function createWatchmanCommandError(error: Error, stderr: string): Error {
+    if (readErrorCode(error) === "ENOENT") {
+        return new Error("watchman command not found. Install Watchman to use watch mode.");
+    }
+
+    const stderrMessage = stderr.trim();
+    if (!stderrMessage) {
+        return error;
+    }
+
+    return new Error(`${error.message}. ${stderrMessage}`);
+}
+
+/**
+ * Formats an unexpected Watchman process exit into a readable error string.
+ *
+ * @param exitCode Exit code returned by the Watchman client process.
+ * @param stderr Captured stderr output.
+ * @param stdout Captured stdout output that was not yet processed.
+ */
+function createWatchmanProcessFailureMessage(exitCode: number | null, stderr: string, stdout: string): string {
+    const stderrMessage = stderr.trim();
+    const stdoutMessage = stdout.trim();
+    const processMessage = exitCode === null ? "Watchman process exited unexpectedly." : `Watchman process exited with code ${exitCode}.`;
+
+    if (stderrMessage) {
+        return `${processMessage} ${stderrMessage}`;
+    }
+
+    if (stdoutMessage) {
+        return `${processMessage} ${stdoutMessage}`;
+    }
+
+    return processMessage;
+}
+
+/**
+ * Resolves the Watchman executable path, preferring an explicit override and known macOS install locations.
+ */
+async function resolveWatchmanExecutablePath(): Promise<string> {
+    if (cachedWatchmanExecutablePath) {
+        return cachedWatchmanExecutablePath;
+    }
+
+    const configuredPath = process.env[WATCHMAN_BINARY_ENV_NAME];
+    if (configuredPath) {
+        cachedWatchmanExecutablePath = configuredPath;
+        return configuredPath;
+    }
+
+    const candidates = process.platform === "darwin" ? [
+        "/opt/homebrew/bin/watchman",
+        "/usr/local/bin/watchman",
+        "watchman"
+    ] : [
+        "watchman"
+    ];
+
+    for (const candidate of candidates) {
+        if (!path.isAbsolute(candidate)) {
+            cachedWatchmanExecutablePath = candidate;
+            return candidate;
+        }
+
+        if (await fs.pathExists(candidate)) {
+            cachedWatchmanExecutablePath = candidate;
+            return candidate;
+        }
+    }
+
+    cachedWatchmanExecutablePath = "watchman";
+    return cachedWatchmanExecutablePath;
+}
+
+/**
  * Suppresses repeated watcher errors for a short time window so the operational log stays readable.
  *
  * @param runtime Runtime state for the current job.
- * @param error Error raised by chokidar.
+ * @param error Error raised by the active watcher backend.
  */
 function shouldLogWatcherError(runtime: IJobRuntime, error: unknown): boolean {
     const key = getWatcherErrorLogKey(error);
@@ -1943,7 +2350,7 @@ function shouldLogWatcherError(runtime: IJobRuntime, error: unknown): boolean {
 /**
  * Normalizes watcher errors to a stable log message so noisy descriptor-limit failures stay deduplicated.
  *
- * @param error Error raised by chokidar.
+ * @param error Error raised by the active watcher backend.
  */
 function formatWatcherErrorMessage(error: unknown): string {
     if (isWatcherLimitError(error)) {
@@ -1956,7 +2363,7 @@ function formatWatcherErrorMessage(error: unknown): string {
 /**
  * Maps watcher errors to a stable throttling key so equivalent failures share the same log window.
  *
- * @param error Error raised by chokidar.
+ * @param error Error raised by the active watcher backend.
  */
 function getWatcherErrorLogKey(error: unknown): string {
     if (isWatcherLimitError(error)) {
@@ -1969,7 +2376,7 @@ function getWatcherErrorLogKey(error: unknown): string {
 /**
  * Chooses the throttling window used for a watcher error.
  *
- * @param error Error raised by chokidar.
+ * @param error Error raised by the active watcher backend.
  */
 function getWatcherErrorLogWindowMs(error: unknown): number {
     if (isWatcherLimitError(error)) {
@@ -1982,7 +2389,7 @@ function getWatcherErrorLogWindowMs(error: unknown): number {
 /**
  * Checks whether a watcher error is caused by OS-level watch descriptor limits.
  *
- * @param error Error raised by chokidar.
+ * @param error Error raised by the active watcher backend.
  */
 function isWatcherLimitError(error: unknown): boolean {
     const errorCode = readErrorCode(error);
@@ -2361,14 +2768,26 @@ function areFileStatesEquivalent(sourceFileState: IFileState, destinationFileSta
  * @param absoluteFilePath Absolute path of the source file that was removed.
  */
 async function deleteFileFromDestinations(runtime: IJobRuntime, absoluteFilePath: string): Promise<void> {
-    const relativePath = getRelativePathFromSource(runtime.config.source, absoluteFilePath);
+    await deletePathFromDestinations(runtime, absoluteFilePath, "file");
+}
+
+/**
+ * Removes a mirrored path from every configured destination.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute path of the source entry that was removed.
+ * @param sourceEntryType Optional source entry type used only for logging.
+ */
+async function deletePathFromDestinations(runtime: IJobRuntime, absolutePath: string, sourceEntryType?: SourceEntryType): Promise<void> {
+    const relativePath = getRelativePathFromSource(runtime.config.source, absolutePath);
 
     for (const destination of runtime.config.destinations) {
         const destinationPath = resolveRelativePath(destination, relativePath);
         await fs.remove(destinationPath);
     }
 
-    log(`[${runtime.config.name}] Deleted file ${relativePath}`);
+    const label = sourceEntryType ?? "path";
+    log(`[${runtime.config.name}] Deleted ${label} ${relativePath}`);
 }
 
 /**
@@ -2378,14 +2797,7 @@ async function deleteFileFromDestinations(runtime: IJobRuntime, absoluteFilePath
  * @param absoluteDirectoryPath Absolute path of the source directory that was removed.
  */
 async function deleteDirectoryFromDestinations(runtime: IJobRuntime, absoluteDirectoryPath: string): Promise<void> {
-    const relativePath = getRelativePathFromSource(runtime.config.source, absoluteDirectoryPath);
-
-    for (const destination of runtime.config.destinations) {
-        const destinationPath = resolveRelativePath(destination, relativePath);
-        await fs.remove(destinationPath);
-    }
-
-    log(`[${runtime.config.name}] Deleted directory ${relativePath}`);
+    await deletePathFromDestinations(runtime, absoluteDirectoryPath, "directory");
 }
 
 /**
@@ -2955,4 +3367,4 @@ if (isDirectExecution) {
     });
 }
 
-export { analyzeRuntime, appendOperationalErrorLog, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, flushQueuedFileEvent, getConfigPath, getRetryDelayMs, handleDirectoryEvent, handleFileEvent, installGlobalCli, isHiddenPath, isIgnored, isPathInsideSource, isWatcherLimitError, main, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, readErrorCode, reconcileRuntimes, reloadIgnoreFiles, renderInstallConfigContent, renderLaunchAgentTemplate, resolveConfiguredPath, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, startWatcher, syncFile };
+export { analyzeRuntime, appendOperationalErrorLog, buildWatchmanSubscribeCommand, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, flushQueuedFileEvent, getConfigPath, getRetryDelayMs, handleDirectoryEvent, handleFileEvent, installGlobalCli, isHiddenPath, isIgnored, isPathInsideSource, isWatcherLimitError, main, normalizeWatchmanEntryType, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, readErrorCode, reconcileRuntimes, reloadIgnoreFiles, renderInstallConfigContent, renderLaunchAgentTemplate, resolveConfiguredPath, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, startWatcher, syncFile };
