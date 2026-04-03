@@ -32,6 +32,7 @@ const FILE_EVENT_BURST_THRESHOLD = 20;
 const WATCHER_ERROR_LOG_WINDOW_MS = 30000;
 const WATCHER_LIMIT_ERROR_LOG_WINDOW_MS = 300000;
 const FILE_STATE_MTIME_TOLERANCE_MS = 10;
+const OPERATION_LOG_DEDUP_WINDOW_MS = 2000;
 const MAX_MANAGED_STDOUT_LOG_SIZE_BYTES = 5 * 1024 * 1024;
 const RETAINED_MANAGED_STDOUT_LOG_SIZE_BYTES = 2 * 1024 * 1024;
 const MANAGED_STDOUT_LOG_MAINTENANCE_WINDOW_MS = 1000;
@@ -63,6 +64,8 @@ let cachedWatchmanExecutablePath: string | undefined;
 const managedStdoutLogPaths = new Set<string>();
 let managedStdoutLogMaintenancePromise: Promise<void> = Promise.resolve();
 let lastManagedStdoutLogMaintenanceAtMs = 0;
+const recentOperationLogs = new Map<string, number>();
+let lastOperationLogCleanupAtMs = 0;
 
 interface ISourceFileVisit {
     absolutePath: string;
@@ -1793,7 +1796,7 @@ async function pruneDestination(runtime: IJobRuntime, destinationRoot: string, c
             }
 
             await fs.remove(absoluteEntryPath);
-            log(`Deleted stale directory ${relativePath}`);
+            logDedupedOperation(runtime, `Deleted stale directory ${relativePath}`);
             continue;
         }
 
@@ -1802,7 +1805,7 @@ async function pruneDestination(runtime: IJobRuntime, destinationRoot: string, c
         }
 
         await fs.remove(absoluteEntryPath);
-        log(`Deleted stale file ${relativePath}`);
+        logDedupedOperation(runtime, `Deleted stale file ${relativePath}`);
     }
 }
 
@@ -2659,7 +2662,7 @@ async function syncDirectory(runtime: IJobRuntime, absoluteDirectoryPath: string
     }
 
     if (shouldLogSyncOperation && createdDestinationCount > 0) {
-        log(`Synced directory ${relativePath} to ${createdDestinationCount} destination(s).`);
+        logDedupedOperation(runtime, `Synced directory ${relativePath} to ${createdDestinationCount} destination(s).`);
     }
 }
 
@@ -2702,7 +2705,7 @@ async function syncFile(runtime: IJobRuntime, absoluteFilePath: string, sourceFi
     }
 
     if (shouldLogSyncOperation && copiedDestinationCount > 0) {
-        log(`Synced ${relativePath}`);
+        logDedupedOperation(runtime, `Synced ${relativePath}`);
     }
 }
 
@@ -2804,7 +2807,7 @@ async function deletePathFromDestinations(runtime: IJobRuntime, absolutePath: st
     }
 
     const label = sourceEntryType ?? "path";
-    log(`Deleted ${label} ${relativePath}`);
+    logDedupedOperation(runtime, `Deleted ${label} ${relativePath}`);
 }
 
 /**
@@ -3337,6 +3340,44 @@ function log(message: string): void {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] ${message}`);
     scheduleManagedStdoutLogMaintenance();
+}
+
+/**
+ * Logs a per-entry operation only once within a short deduplication window for the same source root.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param message Message to print when it is not a recent duplicate.
+ */
+function logDedupedOperation(runtime: IJobRuntime, message: string): void {
+    const now = Date.now();
+
+    if (now - lastOperationLogCleanupAtMs >= OPERATION_LOG_DEDUP_WINDOW_MS) {
+        cleanupRecentOperationLogs(now);
+    }
+
+    const logKey = `${runtime.config.source}\n${message}`;
+    const lastLoggedAt = recentOperationLogs.get(logKey);
+    if (lastLoggedAt !== undefined && now - lastLoggedAt < OPERATION_LOG_DEDUP_WINDOW_MS) {
+        return;
+    }
+
+    recentOperationLogs.set(logKey, now);
+    log(message);
+}
+
+/**
+ * Removes expired per-entry log deduplication entries so the in-memory cache stays bounded.
+ *
+ * @param now Current timestamp used to evaluate the deduplication window.
+ */
+function cleanupRecentOperationLogs(now: number): void {
+    for (const [logKey, loggedAt] of recentOperationLogs.entries()) {
+        if (now - loggedAt >= OPERATION_LOG_DEDUP_WINDOW_MS) {
+            recentOperationLogs.delete(logKey);
+        }
+    }
+
+    lastOperationLogCleanupAtMs = now;
 }
 
 /**

@@ -533,6 +533,40 @@ test("runFullSync logs sync entries outside reconcile", async () => {
     }
 });
 
+test("syncFile suppresses duplicate sync logs inside the deduplication window", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+
+    await fs.ensureDir(sourcePath);
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(sourceFilePath, "payload", "utf8");
+
+    const runtime = await createRuntime({
+        name: "deduped-sync-log",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await syncFile(runtime, sourceFilePath);
+            await syncFile(runtime, sourceFilePath);
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
+        const syncLogs = normalizedLogs.filter((entry) => entry === "Synced keep.txt");
+
+        assert.equal(syncLogs.length, 1);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
 test("sync logs trim launchd.log when it grows beyond the size limit", async () => {
     const tempDirectory = await createTempDirectory();
     const sourcePath = path.join(tempDirectory, "source");
