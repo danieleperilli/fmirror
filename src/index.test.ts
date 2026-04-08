@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import fs from "fs-extra";
 import type { IJobRuntime } from "./interfaces";
-import { analyzeRuntime, buildWatchmanSubscribeCommand, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, getConfigPath, handleDirectoryEvent, handleFileEvent, installGlobalCli, isWatcherLimitError, normalizeWatchmanEntryType, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, reconcileRuntimes, renderInstallConfigContent, renderLaunchAgentTemplate, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, syncFile } from "./index";
+import { analyzeRuntime, buildWatchmanDirectoryExclusionExpression, buildWatchmanSubscribeCommand, collectWatchmanExcludedDirectories, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, getConfigPath, handleDirectoryEvent, handleFileEvent, handleWatchmanFileNotification, installGlobalCli, isWatcherLimitError, normalizeWatchmanEntryType, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, reconcileRuntimes, renderInstallConfigContent, renderLaunchAgentTemplate, restartWatcher, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, syncFile } from "./index";
 
 test("getConfigPath prefers the CLI argument", async () => {
     const resolvedPath = getConfigPath([
@@ -178,7 +178,8 @@ test("buildWatchmanSubscribeCommand includes relative_root only when it is provi
             fields: [
                 "name",
                 "exists",
-                "type"
+                "type",
+                "new"
             ],
             since: "c:1:2"
         }
@@ -191,10 +192,62 @@ test("buildWatchmanSubscribeCommand includes relative_root only when it is provi
             fields: [
                 "name",
                 "exists",
-                "type"
+                "type",
+                "new"
             ],
             since: "c:1:2",
             relative_root: "nested/project"
+        }
+    ]);
+});
+
+test("buildWatchmanDirectoryExclusionExpression excludes exact directories and their descendants", async () => {
+    assert.deepEqual(buildWatchmanDirectoryExclusionExpression([
+        "app/node_modules",
+        ".fmirror"
+    ]), [
+        "not",
+        [
+            "anyof",
+            [
+                "name",
+                [
+                    ".fmirror",
+                    "app/node_modules"
+                ],
+                "wholename"
+            ],
+            [
+                "dirname",
+                ".fmirror"
+            ],
+            [
+                "dirname",
+                "app/node_modules"
+            ]
+        ]
+    ]);
+});
+
+test("buildWatchmanSubscribeCommand includes the Watchman expression when provided", async () => {
+    const expression = buildWatchmanDirectoryExclusionExpression([
+        "app/node_modules"
+    ]);
+
+    assert.deepEqual(buildWatchmanSubscribeCommand("/tmp/root", "fmirror-test", "c:1:2", "nested/project", expression), [
+        "subscribe",
+        "/tmp/root",
+        "fmirror-test",
+        {
+            fields: [
+                "name",
+                "exists",
+                "type",
+                "new"
+            ],
+            since: "c:1:2",
+            relative_root: "nested/project",
+            expression
         }
     ]);
 });
@@ -335,6 +388,12 @@ async function disposeRuntime(runtime: IJobRuntime): Promise<void> {
         }
     }
 
+    for (const queuedDelete of runtime.queuedDirectoryDeletes.values()) {
+        if (queuedDelete.debounceTimer) {
+            clearTimeout(queuedDelete.debounceTimer);
+        }
+    }
+
     await runtime.queuePersistencePromise;
 
     if (runtime.watcher) {
@@ -360,6 +419,7 @@ function createRuntimeStub(): IJobRuntime {
         queueFilePath: "/tmp/source/.fmirror/queue.json",
         fileEventDebounceMs: 25,
         queuedFileEvents: new Map(),
+        queuedDirectoryDeletes: new Map(),
         recoveredQueuePaths: [],
         queuePersistencePromise: Promise.resolve(),
         fileEventBurstCount: 0,
@@ -563,6 +623,50 @@ test("syncFile suppresses duplicate sync logs inside the deduplication window", 
 
         assert.equal(syncLogs.length, 1);
     } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("syncFile overwrites destination files without unlinking them first", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+    const destinationFilePath = path.join(destinationPath, "keep.txt");
+    const mutableFs = fs as typeof fs & {
+        unlink: typeof fs.unlink;
+    };
+    const originalUnlink = fs.unlink.bind(fs);
+    const unlinkedPaths: string[] = [];
+
+    await fs.ensureDir(sourcePath);
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(sourceFilePath, "updated", "utf8");
+    await fs.writeFile(destinationFilePath, "existing", "utf8");
+
+    const runtime = await createRuntime({
+        name: "overwrite-without-unlink",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    mutableFs.unlink = (async (...args: Parameters<typeof fs.unlink>) => {
+        const targetPath = typeof args[0] === "string" ? args[0] : String(args[0]);
+        unlinkedPaths.push(path.resolve(targetPath));
+        return await originalUnlink(...args);
+    }) as typeof fs.unlink;
+
+    try {
+        await syncFile(runtime, sourceFilePath);
+
+        assert.equal(await fs.readFile(destinationFilePath, "utf8"), "updated");
+        assert.equal(unlinkedPaths.includes(path.resolve(destinationFilePath)), false);
+    } finally {
+        mutableFs.unlink = originalUnlink;
         await disposeRuntime(runtime);
     }
 });
@@ -1145,6 +1249,45 @@ test("runFullSync preserves git bootstrap directories re-included by .fmirror-ig
     }
 });
 
+test("collectWatchmanExcludedDirectories collapses ignored trees to existing ignored directories", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+
+    await fs.ensureDir(path.join(sourcePath, "app", "node_modules", ".bin"));
+    await fs.ensureDir(path.join(sourcePath, "app", "dist", "assets"));
+    await fs.ensureDir(path.join(sourcePath, "app", ".git", "objects"));
+    await fs.ensureDir(path.join(sourcePath, "app", ".git", "hooks"));
+    await fs.writeFile(path.join(sourcePath, ".fmirror-ignore"), [
+        "**/node_modules",
+        "**/dist",
+        "**/.git/**",
+        "!**/.git/",
+        "!**/.git/objects/"
+    ].join("\n"), "utf8");
+
+    const runtime = await createRuntime({
+        name: "watchman-excluded-directories",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        assert.deepEqual(await collectWatchmanExcludedDirectories(runtime), [
+            ".fmirror",
+            "app/.git/hooks",
+            "app/dist",
+            "app/node_modules"
+        ]);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
 test("nested ignore files can re-include files in child folders", async () => {
     const tempDirectory = await createTempDirectory();
     const sourcePath = path.join(tempDirectory, "source");
@@ -1182,10 +1325,10 @@ test("queued file events stay persisted until a retry succeeds", async () => {
     const destinationPath = path.join(tempDirectory, "destination");
     const sourceFilePath = path.join(sourcePath, "nested", "file.txt");
     const mutableFs = fs as typeof fs & {
-        copy: typeof fs.copy;
+        copyFile: typeof fs.copyFile;
     };
-    const originalCopy = fs.copy.bind(fs);
-    let shouldFailCopy = true;
+    const originalCopyFile = fs.copyFile.bind(fs);
+    let shouldFailCopyFile = true;
 
     await fs.ensureDir(path.dirname(sourceFilePath));
     await fs.writeFile(sourceFilePath, "payload", "utf8");
@@ -1201,14 +1344,14 @@ test("queued file events stay persisted until a retry succeeds", async () => {
         watchHidden: true
     }, 25);
 
-    mutableFs.copy = (async (...args: Parameters<typeof fs.copy>) => {
-        if (shouldFailCopy) {
-            shouldFailCopy = false;
+    mutableFs.copyFile = (async (...args: Parameters<typeof fs.copyFile>) => {
+        if (shouldFailCopyFile) {
+            shouldFailCopyFile = false;
             throw new Error("Simulated copy failure");
         }
 
-        return originalCopy(...args);
-    }) as typeof fs.copy;
+        return await originalCopyFile(...args);
+    }) as typeof fs.copyFile;
 
     try {
         queueFileEvent(runtime, sourceFilePath, "change");
@@ -1225,7 +1368,7 @@ test("queued file events stay persisted until a retry succeeds", async () => {
         assert.equal(await fs.readFile(path.join(destinationPath, "nested", "file.txt"), "utf8"), "payload");
         await waitForCondition(async () => !runtime.queuedFileEvents.has(sourceFilePath), 2000);
     } finally {
-        mutableFs.copy = originalCopy;
+        mutableFs.copyFile = originalCopyFile;
         await disposeRuntime(runtime);
     }
 });
@@ -1303,7 +1446,7 @@ test("directory move events trigger a reconciliation fallback", async () => {
     }
 });
 
-test("handleDirectoryEvent mirrors empty directory additions immediately", async () => {
+test("handleDirectoryEvent mirrors empty directory additions immediately without a full sync", async () => {
     const tempDirectory = await createTempDirectory();
     const sourcePath = path.join(tempDirectory, "source");
     const destinationPath = path.join(tempDirectory, "destination");
@@ -1323,9 +1466,373 @@ test("handleDirectoryEvent mirrors empty directory additions immediately", async
 
     try {
         await fs.ensureDir(addedDirectoryPath);
-        await handleDirectoryEvent(runtime, addedDirectoryPath, "addDir", 50);
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await handleDirectoryEvent(runtime, addedDirectoryPath, "addDir", 50);
+
+            await new Promise<void>((resolve) => {
+                setTimeout(resolve, 80);
+            });
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
 
         assert.equal((await fs.stat(path.join(destinationPath, "empty-added"))).isDirectory(), true);
+        assert.equal(normalizedLogs.includes("Structural change detected (addDir) at empty-added. Syncing subtree incrementally."), true);
+        assert.equal(normalizedLogs.includes("Full sync started."), false);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("handleDirectoryEvent mirrors populated directory additions incrementally", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const addedDirectoryPath = path.join(sourcePath, "features");
+    const nestedDirectoryPath = path.join(addedDirectoryPath, "reports");
+    const nestedFilePath = path.join(nestedDirectoryPath, "daily.txt");
+
+    await fs.ensureDir(nestedDirectoryPath);
+    await fs.writeFile(nestedFilePath, "payload", "utf8");
+
+    const runtime = await createRuntime({
+        name: "mirror-populated-add-dir",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await handleDirectoryEvent(runtime, addedDirectoryPath, "addDir", 50);
+
+            await new Promise<void>((resolve) => {
+                setTimeout(resolve, 80);
+            });
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
+
+        assert.equal(await fs.readFile(path.join(destinationPath, "features", "reports", "daily.txt"), "utf8"), "payload");
+        assert.equal(normalizedLogs.includes("Structural change detected (addDir) at features. Syncing subtree incrementally."), true);
+        assert.equal(normalizedLogs.includes("Full sync started."), false);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("handleDirectoryEvent waits before deleting transiently missing directories", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceDirectoryPath = path.join(sourcePath, "docs");
+    const sourceFilePath = path.join(sourceDirectoryPath, "keep.txt");
+    const destinationDirectoryPath = path.join(destinationPath, "docs");
+
+    await fs.ensureDir(sourceDirectoryPath);
+    await fs.writeFile(sourceFilePath, "payload", "utf8");
+
+    const runtime = await createRuntime({
+        name: "delay-unlink-dir",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 40);
+
+    try {
+        await runInitialSync(runtime);
+        await fs.remove(sourceDirectoryPath);
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await handleDirectoryEvent(runtime, sourceDirectoryPath, "unlinkDir", 50);
+
+            await new Promise<void>((resolve) => {
+                setTimeout(resolve, 55);
+            });
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
+
+        assert.equal(await fs.pathExists(destinationDirectoryPath), true);
+        assert.equal(normalizedLogs.includes("Structural change detected (unlinkDir) at docs. Running reconciliation."), false);
+
+        await fs.ensureDir(sourceDirectoryPath);
+        await fs.writeFile(sourceFilePath, "restored", "utf8");
+        await handleDirectoryEvent(runtime, sourceDirectoryPath, "addDir", 50);
+
+        await waitForCondition(async () => {
+            if (!(await fs.pathExists(path.join(destinationDirectoryPath, "keep.txt")))) {
+                return false;
+            }
+
+            return (await fs.readFile(path.join(destinationDirectoryPath, "keep.txt"), "utf8")) === "restored";
+        }, 2000);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("handleDirectoryEvent skips ignored directory additions", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const ignoredDirectoryPath = path.join(sourcePath, "ignored-dir");
+
+    await fs.ensureDir(sourcePath);
+    await fs.writeFile(path.join(sourcePath, ".fmirror-ignore"), "ignored-dir/\n", "utf8");
+
+    const runtime = await createRuntime({
+        name: "skip-ignored-add-dir",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        await fs.ensureDir(ignoredDirectoryPath);
+
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await handleDirectoryEvent(runtime, ignoredDirectoryPath, "addDir", 50);
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
+
+        assert.equal(await fs.pathExists(path.join(destinationPath, "ignored-dir")), false);
+        assert.equal(normalizedLogs.includes("Synced directory ignored-dir to 1 destination(s)."), false);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("handleFileEvent skips ignored unlink events", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const ignoredFilePath = path.join(sourcePath, "ignored.txt");
+    const mirroredIgnoredFilePath = path.join(destinationPath, "ignored.txt");
+
+    await fs.ensureDir(sourcePath);
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(ignoredFilePath, "payload", "utf8");
+    await fs.writeFile(path.join(sourcePath, ".fmirror-ignore"), "ignored.txt\n", "utf8");
+    await fs.writeFile(mirroredIgnoredFilePath, "stale", "utf8");
+
+    const runtime = await createRuntime({
+        name: "skip-ignored-unlink",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        await fs.remove(ignoredFilePath);
+
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await handleFileEvent(runtime, ignoredFilePath, "unlink");
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
+
+        assert.equal(await fs.pathExists(mirroredIgnoredFilePath), true);
+        assert.equal(normalizedLogs.includes("Deleted file ignored.txt"), false);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("restartWatcher replaces the current watcher session", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    let closedExistingWatcher = false;
+    let createdWatcher = false;
+
+    await fs.ensureDir(sourcePath);
+
+    const runtime = await createRuntime({
+        name: "restart-watcher",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        const nextWatcher = {
+            close: async (): Promise<void> => {
+                return;
+            }
+        };
+
+        runtime.watcher = {
+            close: async (): Promise<void> => {
+                closedExistingWatcher = true;
+            }
+        };
+
+        assert.equal(await restartWatcher(runtime, 25, async () => {
+            createdWatcher = true;
+            return nextWatcher;
+        }), true);
+        assert.equal(closedExistingWatcher, true);
+        assert.equal(createdWatcher, true);
+        assert.equal(runtime.watcher, nextWatcher);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("Watchman delete notifications wait before deleting mirrored files", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceFilePath = path.join(sourcePath, "keep.txt");
+    const destinationFilePath = path.join(destinationPath, "keep.txt");
+
+    await fs.ensureDir(sourcePath);
+    await fs.ensureDir(destinationPath);
+    await fs.writeFile(sourceFilePath, "initial", "utf8");
+
+    const runtime = await createRuntime({
+        name: "watchman-delete-delay",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 40);
+
+    try {
+        await runInitialSync(runtime);
+        await fs.remove(sourceFilePath);
+        await handleWatchmanFileNotification(runtime, {
+            name: "keep.txt",
+            exists: false,
+            type: "f"
+        }, 50);
+
+        await new Promise<void>((resolve) => {
+            setTimeout(resolve, 55);
+        });
+
+        assert.equal(await fs.pathExists(destinationFilePath), true);
+        assert.equal(await fs.readFile(destinationFilePath, "utf8"), "initial");
+
+        await fs.writeFile(sourceFilePath, "restored", "utf8");
+
+        await waitForCondition(async () => {
+            if (!(await fs.pathExists(destinationFilePath))) {
+                return false;
+            }
+
+            return (await fs.readFile(destinationFilePath, "utf8")) === "restored";
+        }, 2000);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("Watchman directory notifications sync only the directory when it already existed", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const sourceDirectoryPath = path.join(sourcePath, "docs");
+    const existingSourceFilePath = path.join(sourceDirectoryPath, "keep.txt");
+    const movedSourceFilePath = path.join(sourceDirectoryPath, "incoming.txt");
+
+    await fs.ensureDir(sourceDirectoryPath);
+    await fs.writeFile(existingSourceFilePath, "keep", "utf8");
+
+    const runtime = await createRuntime({
+        name: "watchman-existing-dir-update",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        await runInitialSync(runtime);
+        await fs.writeFile(movedSourceFilePath, "incoming", "utf8");
+
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await handleWatchmanFileNotification(runtime, {
+                name: "docs",
+                exists: true,
+                type: "d",
+                new: false
+            }, 50);
+            await handleWatchmanFileNotification(runtime, {
+                name: "docs/incoming.txt",
+                exists: true,
+                type: "f"
+            }, 50);
+
+            await new Promise<void>((resolve) => {
+                setTimeout(resolve, 80);
+            });
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
+
+        assert.equal(await fs.readFile(path.join(destinationPath, "docs", "keep.txt"), "utf8"), "keep");
+        assert.equal(await fs.readFile(path.join(destinationPath, "docs", "incoming.txt"), "utf8"), "incoming");
+        assert.equal(normalizedLogs.includes("Structural change detected (addDir) at docs. Syncing subtree incrementally."), false);
+        assert.equal(normalizedLogs.includes("Synced docs/keep.txt"), false);
+        assert.equal(normalizedLogs.includes("Synced docs/incoming.txt"), true);
+    } finally {
+        await disposeRuntime(runtime);
+    }
+});
+
+test("Watchman addDir notifications still sync the subtree for new directories", async () => {
+    const tempDirectory = await createTempDirectory();
+    const sourcePath = path.join(tempDirectory, "source");
+    const destinationPath = path.join(tempDirectory, "destination");
+    const addedDirectoryPath = path.join(sourcePath, "features");
+    const nestedDirectoryPath = path.join(addedDirectoryPath, "reports");
+    const nestedFilePath = path.join(nestedDirectoryPath, "daily.txt");
+
+    await fs.ensureDir(nestedDirectoryPath);
+    await fs.writeFile(nestedFilePath, "payload", "utf8");
+
+    const runtime = await createRuntime({
+        name: "watchman-new-dir-update",
+        source: sourcePath,
+        destinations: [
+            destinationPath
+        ],
+        deleteMissing: true,
+        watchHidden: true
+    }, 25);
+
+    try {
+        const capturedLogs = await captureConsoleLogs(async () => {
+            await handleWatchmanFileNotification(runtime, {
+                name: "features",
+                exists: true,
+                type: "d",
+                new: true
+            }, 50);
+
+            await new Promise<void>((resolve) => {
+                setTimeout(resolve, 80);
+            });
+        });
+        const normalizedLogs = capturedLogs.map((entry) => entry.replace(/^\[[^\]]+\] /, ""));
+
+        assert.equal(await fs.readFile(path.join(destinationPath, "features", "reports", "daily.txt"), "utf8"), "payload");
+        assert.equal(normalizedLogs.includes("Structural change detected (addDir) at features. Syncing subtree incrementally."), true);
     } finally {
         await disposeRuntime(runtime);
     }
@@ -1562,6 +2069,7 @@ test("setupMirror creates config, preserves existing ignore rules, and registers
     assert.match(installedPlistContent, /<integer>200000<\/integer>/);
     assert.equal((await fs.lstat(installPaths.launchAgentSymlinkPath)).isSymbolicLink(), true);
     assert.equal(path.resolve(path.dirname(installPaths.launchAgentSymlinkPath), await fs.readlink(installPaths.launchAgentSymlinkPath)), installPaths.launchAgentPath);
+    assert.equal(await fs.pathExists(path.join(installPaths.internalAppDirectoryPath, "reset-launchd.sh")), false);
     assert.deepEqual(executedCommands, [
         {
             command: "launchctl",

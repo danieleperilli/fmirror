@@ -327,8 +327,9 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.fmirror-source-fol
 - This tool mirrors files. It is not a bidirectional sync.
 - Destination changes are not copied back to the source.
 - If a `.fmirror-ignore` file changes, the app reloads ignore rules and performs a full reconciliation.
+- Watch mode also asks Watchman to suppress notifications for directories that are currently ignored, and refreshes that subscription when `.fmirror-ignore` changes.
 - Watch mode uses Watchman as the only watcher backend and fails fast when the `watchman` command is not available.
-- Directory-level moves and structural changes schedule a reconciliation automatically, so rename and move operations converge to the final tree state even when raw watcher events are noisy.
+- Directory additions are mirrored by syncing the new subtree immediately, while directory removals and other structural changes still schedule a reconciliation so rename and move operations converge to the final tree state even when raw watcher events are noisy.
 - Large bursts of file events also trigger a reconciliation fallback, which makes mass deletions and large refactors more reliable.
 - When `deleteMissing` is `true`, startup and ignore reloads also remove stale files from destinations so they match the current mirrored source state.
 - Failed file events stay on the persisted queue and are retried automatically until they succeed.

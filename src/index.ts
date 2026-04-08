@@ -15,7 +15,7 @@ import path from "node:path";
 import os from "node:os";
 import { promisify } from "node:util";
 import ignore from "ignore";
-import type { CliCommandName, FileEventName, IAppConfig, ICliArguments, IDestinationAnalysis, IFileState, IIgnoreFile, IJobConfig, IJobRuntime, IPersistedQueueItem, IPersistedQueueState, IQueuedFileEvent, IRuntimeAnalysis, IWatchSession } from "./interfaces";
+import type { CliCommandName, FileEventName, IAppConfig, ICliArguments, IDestinationAnalysis, IFileState, IIgnoreFile, IJobConfig, IJobRuntime, IPersistedQueueItem, IPersistedQueueState, IQueuedDirectoryDelete, IQueuedFileEvent, IQueuedFullSyncRequest, IRuntimeAnalysis, IWatchSession } from "./interfaces";
 
 const DEFAULT_CONFIG_FILE_NAME = "fmirror.config.json";
 const IGNORE_FILE_NAME = ".fmirror-ignore";
@@ -138,6 +138,7 @@ interface IWatchmanSubscriptionFile {
     name: string;
     exists?: boolean;
     type?: string;
+    new?: boolean;
 }
 
 interface IWatchmanSubscriptionNotification {
@@ -152,6 +153,7 @@ interface IWatchmanSubscriptionOptions {
     fields: string[];
     since: string;
     relative_root?: string;
+    expression?: unknown[];
 }
 
 interface IWatchmanSession extends IWatchSession {
@@ -540,6 +542,7 @@ async function createRuntime(job: IJobConfig, fileEventDebounceMs: number): Prom
         queueFilePath,
         fileEventDebounceMs,
         queuedFileEvents: new Map<string, IQueuedFileEvent>(),
+        queuedDirectoryDeletes: new Map<string, IQueuedDirectoryDelete>(),
         recoveredQueuePaths: [],
         fileEventBurstCount: 0,
         queuePersistencePromise: Promise.resolve()
@@ -957,8 +960,8 @@ async function setupMirror(installArguments: IInstallArguments, installEnvironme
 
     await fs.ensureDir(path.dirname(installPaths.launchAgentPath));
     await fs.writeFile(installPaths.launchAgentPath, launchAgentContent, "utf8");
-    await installLaunchAgent(installEnvironment, installPaths);
     await ensureManagedSymlink(installPaths.launchAgentSymlinkPath, installPaths.launchAgentPath);
+    await installLaunchAgent(installEnvironment, installPaths);
 
     return installPaths;
 }
@@ -1611,6 +1614,24 @@ async function visitSourceFiles(runtime: IJobRuntime, currentDirectory: string, 
 }
 
 /**
+ * Mirrors a newly added source directory by syncing the directory itself and every mirrored entry below it.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absoluteDirectoryPath Absolute source directory path that should be mirrored recursively.
+ */
+async function syncSourceSubtree(runtime: IJobRuntime, absoluteDirectoryPath: string): Promise<void> {
+    await syncDirectory(runtime, absoluteDirectoryPath);
+
+    await visitSourceDirectories(runtime, absoluteDirectoryPath, async (nestedDirectoryPath) => {
+        await syncDirectory(runtime, nestedDirectoryPath);
+    });
+
+    await visitSourceFiles(runtime, absoluteDirectoryPath, async (sourceFile) => {
+        await syncFile(runtime, sourceFile.absolutePath, sourceFile.fileState);
+    });
+}
+
+/**
  * Creates the empty analysis accumulator for a destination before source and destination scans run.
  *
  * @param destination Destination path being analyzed.
@@ -1816,18 +1837,7 @@ async function pruneDestination(runtime: IJobRuntime, destinationRoot: string, c
  * @param debounceMs Delay used to debounce full reloads after ignore file changes.
  */
 async function startWatcher(runtime: IJobRuntime, debounceMs: number): Promise<boolean> {
-    let watcher: IWatchSession | undefined;
-
-    try {
-        watcher = await createWatcher(runtime, debounceMs);
-        runtime.watcher = watcher;
-    } catch (error) {
-        await handleWatcherStartupError(runtime, watcher, error);
-        return false;
-    }
-
-    log(`Watcher ready.`);
-    return true;
+    return await restartWatcher(runtime, debounceMs);
 }
 
 /**
@@ -1843,11 +1853,13 @@ async function createWatcher(runtime: IJobRuntime, debounceMs: number): Promise<
     ]);
     const watchRoot = watchProjectResponse.watch;
     const relativeRoot = watchProjectResponse.relative_path;
+    const watchmanExcludedDirectories = await collectWatchmanExcludedDirectories(runtime);
+    const watchmanExpression = buildWatchmanDirectoryExclusionExpression(watchmanExcludedDirectories);
     const clockResponse = await runWatchmanCommand<IWatchmanClockResponse>([
         "clock",
         watchRoot
     ]);
-    return await createWatchmanSubscriptionSession(runtime, debounceMs, watchRoot, relativeRoot, clockResponse.clock);
+    return await createWatchmanSubscriptionSession(runtime, debounceMs, watchRoot, relativeRoot, clockResponse.clock, watchmanExpression);
 }
 
 /**
@@ -1905,6 +1917,35 @@ async function closeWatcherSafely(watcher: IWatchSession): Promise<void> {
     } catch {
         return;
     }
+}
+
+/**
+ * Replaces the current watcher session with a fresh Watchman subscription.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param debounceMs Delay used to debounce full reloads after ignore file changes.
+ * @param createWatcherSession Factory used to build the next watcher session.
+ */
+async function restartWatcher(runtime: IJobRuntime, debounceMs: number, createWatcherSession: (runtime: IJobRuntime, debounceMs: number) => Promise<IWatchSession> = createWatcher): Promise<boolean> {
+    const previousWatcher = runtime.watcher;
+    runtime.watcher = undefined;
+
+    if (previousWatcher) {
+        await closeWatcherSafely(previousWatcher);
+    }
+
+    let watcher: IWatchSession | undefined;
+
+    try {
+        watcher = await createWatcherSession(runtime, debounceMs);
+        runtime.watcher = watcher;
+    } catch (error) {
+        await handleWatcherStartupError(runtime, watcher, error);
+        return false;
+    }
+
+    log(previousWatcher ? `Watcher refreshed.` : `Watcher ready.`);
+    return true;
 }
 
 /**
@@ -1973,7 +2014,7 @@ async function runWatchmanCommand<TResponse extends { error?: string; warning?: 
  * @param relativeRoot Optional source-relative root inside the watched tree.
  * @param sinceClock Clock captured immediately before the subscription starts.
  */
-async function createWatchmanSubscriptionSession(runtime: IJobRuntime, debounceMs: number, watchRoot: string, relativeRoot: string | undefined, sinceClock: string): Promise<IWatchmanSession> {
+async function createWatchmanSubscriptionSession(runtime: IJobRuntime, debounceMs: number, watchRoot: string, relativeRoot: string | undefined, sinceClock: string, watchmanExpression?: unknown[]): Promise<IWatchmanSession> {
     const subscriptionName = createWatchmanSubscriptionName(runtime.config.name);
     const watchmanExecutablePath = await resolveWatchmanExecutablePath();
 
@@ -2094,7 +2135,7 @@ async function createWatchmanSubscriptionSession(runtime: IJobRuntime, debounceM
             }
         });
 
-        process.stdin.write(`${JSON.stringify(buildWatchmanSubscribeCommand(watchRoot, subscriptionName, sinceClock, relativeRoot))}\n`);
+        process.stdin.write(`${JSON.stringify(buildWatchmanSubscribeCommand(watchRoot, subscriptionName, sinceClock, relativeRoot, watchmanExpression))}\n`);
     });
 }
 
@@ -2153,6 +2194,7 @@ async function handleWatchmanSubscriptionNotification(runtime: IJobRuntime, noti
  */
 async function handleWatchmanFileNotification(runtime: IJobRuntime, changedFile: IWatchmanSubscriptionFile, debounceMs: number): Promise<void> {
     const absolutePath = path.resolve(runtime.config.source, changedFile.name);
+    const normalizedSourceEntryType = normalizeWatchmanEntryType(changedFile.type);
 
     if (!isPathInsideSource(runtime.config.source, absolutePath)) {
         return;
@@ -2160,7 +2202,7 @@ async function handleWatchmanFileNotification(runtime: IJobRuntime, changedFile:
 
     if (path.basename(absolutePath) === IGNORE_FILE_NAME && !isOperationalPath(runtime.config.source, absolutePath)) {
         log(`${IGNORE_FILE_NAME} changed. Reloading rules.`);
-        queueRuntimeFullSync(runtime, debounceMs, "Ignore rules changed.", true);
+        queueRuntimeFullSync(runtime, debounceMs, "Ignore rules changed.", true, true);
         return;
     }
 
@@ -2169,19 +2211,32 @@ async function handleWatchmanFileNotification(runtime: IJobRuntime, changedFile:
     }
 
     if (changedFile.exists === false) {
-        if (runtime.config.deleteMissing) {
-            await deletePathFromDestinations(runtime, absolutePath);
+        if (!shouldMirrorSourcePath(runtime, absolutePath, normalizedSourceEntryType === "directory")) {
+            return;
         }
+
+        if (normalizedSourceEntryType === "directory") {
+            await handleDirectoryEvent(runtime, absolutePath, "unlinkDir", debounceMs);
+            return;
+        }
+
+        queueFileEvent(runtime, absolutePath, "unlink", debounceMs);
         return;
     }
 
-    const sourceEntryType = normalizeWatchmanEntryType(changedFile.type) ?? await readMirrorableSourceEntryType(runtime, absolutePath);
+    const sourceEntryType = normalizedSourceEntryType ?? await readMirrorableSourceEntryType(runtime, absolutePath);
     if (!sourceEntryType) {
         return;
     }
 
     if (sourceEntryType === "directory") {
-        await handleDirectoryEvent(runtime, absolutePath, "addDir", debounceMs);
+        if (changedFile.new === true) {
+            await handleDirectoryEvent(runtime, absolutePath, "addDir", debounceMs);
+            return;
+        }
+
+        cancelQueuedDirectoryDelete(runtime, absolutePath);
+        await syncDirectory(runtime, absolutePath);
         return;
     }
 
@@ -2195,13 +2250,15 @@ async function handleWatchmanFileNotification(runtime: IJobRuntime, changedFile:
  * @param subscriptionName Subscription identifier scoped to the current job.
  * @param sinceClock Clock value captured just before the subscription begins.
  * @param relativeRoot Optional source-relative root inside the watch root.
+ * @param watchmanExpression Optional Watchman expression applied to the subscription.
  */
-function buildWatchmanSubscribeCommand(watchRoot: string, subscriptionName: string, sinceClock: string, relativeRoot?: string): unknown[] {
+function buildWatchmanSubscribeCommand(watchRoot: string, subscriptionName: string, sinceClock: string, relativeRoot?: string, watchmanExpression?: unknown[]): unknown[] {
     const subscriptionOptions: IWatchmanSubscriptionOptions = {
         fields: [
             "name",
             "exists",
-            "type"
+            "type",
+            "new"
         ],
         since: sinceClock
     };
@@ -2210,12 +2267,87 @@ function buildWatchmanSubscribeCommand(watchRoot: string, subscriptionName: stri
         subscriptionOptions.relative_root = relativeRoot;
     }
 
+    if (watchmanExpression) {
+        subscriptionOptions.expression = watchmanExpression;
+    }
+
     return [
         "subscribe",
         watchRoot,
         subscriptionName,
         subscriptionOptions
     ];
+}
+
+/**
+ * Builds a Watchman expression that excludes already-ignored directories from subscription results.
+ *
+ * @param relativeDirectories Source-relative ignored directories that should be hidden from Watchman notifications.
+ */
+function buildWatchmanDirectoryExclusionExpression(relativeDirectories: string[]): unknown[] | undefined {
+    const normalizedDirectories = Array.from(new Set(relativeDirectories.filter((relativeDirectory) => relativeDirectory.length > 0))).sort();
+    if (normalizedDirectories.length === 0) {
+        return undefined;
+    }
+
+    return [
+        "not",
+        [
+            "anyof",
+            [
+                "name",
+                normalizedDirectories,
+                "wholename"
+            ],
+            ...normalizedDirectories.map((relativeDirectory) => [
+                "dirname",
+                relativeDirectory
+            ])
+        ]
+    ];
+}
+
+/**
+ * Collects the currently existing ignored directories so Watchman can suppress their notifications.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param currentDirectory Absolute directory currently being scanned.
+ * @param excludedDirectories Mutable collection of ignored directories relative to the source root.
+ */
+async function collectWatchmanExcludedDirectories(runtime: IJobRuntime, currentDirectory: string = runtime.config.source, excludedDirectories: string[] = []): Promise<string[]> {
+    let entries: fs.Dirent[];
+
+    try {
+        entries = await fs.readdir(currentDirectory, { withFileTypes: true });
+    } catch (error) {
+        if (isMissingPathError(error)) {
+            return excludedDirectories;
+        }
+
+        throw error;
+    }
+
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+
+    for (const entry of entries) {
+        if (!entry.isDirectory()) {
+            continue;
+        }
+
+        const absoluteEntryPath = path.join(currentDirectory, entry.name);
+
+        if (!shouldMirrorSourcePath(runtime, absoluteEntryPath, true)) {
+            const relativeDirectory = getRelativePathFromSource(runtime.config.source, absoluteEntryPath);
+            if (relativeDirectory) {
+                excludedDirectories.push(relativeDirectory);
+            }
+            continue;
+        }
+
+        await collectWatchmanExcludedDirectories(runtime, absoluteEntryPath, excludedDirectories);
+    }
+
+    return excludedDirectories;
 }
 
 /**
@@ -2454,12 +2586,12 @@ function queueFileEvent(runtime: IJobRuntime, filePath: string, eventName: FileE
         runAfterCurrent: false,
         retryCount: 0
     };
+    const previousEventName = queuedEvent.eventName;
 
     queuedEvent.eventName = eventName;
     queuedEvent.retryCount = 0;
-
-    if (queuedEvent.debounceTimer) {
-        clearTimeout(queuedEvent.debounceTimer);
+    if (eventName !== "unlink" || previousEventName !== "unlink") {
+        queuedEvent.missingSinceAtMs = undefined;
     }
 
     if (queuedEvent.retryTimer) {
@@ -2467,12 +2599,8 @@ function queueFileEvent(runtime: IJobRuntime, filePath: string, eventName: FileE
         queuedEvent.retryTimer = undefined;
     }
 
-    queuedEvent.debounceTimer = setTimeout(() => {
-        queuedEvent.debounceTimer = undefined;
-        void flushQueuedFileEvent(runtime, absolutePath);
-    }, runtime.fileEventDebounceMs);
-
     runtime.queuedFileEvents.set(absolutePath, queuedEvent);
+    scheduleQueuedFileEventFlush(runtime, absolutePath, queuedEvent, runtime.fileEventDebounceMs);
     registerFileEventBurst(runtime, fullSyncDebounceMs);
     void persistQueuedFileEvents(runtime);
 }
@@ -2499,10 +2627,18 @@ async function flushQueuedFileEvent(runtime: IJobRuntime, absolutePath: string):
     queuedEvent.isProcessing = true;
     queuedEvent.runAfterCurrent = false;
     let wasSuccessful = false;
+    let shouldRetainQueuedEvent = false;
     let flushError: unknown;
 
     try {
+        if (eventName === "unlink" && await shouldDelayQueuedUnlinkEvent(runtime, absolutePath, queuedEvent)) {
+            wasSuccessful = true;
+            shouldRetainQueuedEvent = true;
+            return;
+        }
+
         await handleFileEvent(runtime, absolutePath, eventName);
+        queuedEvent.missingSinceAtMs = undefined;
         queuedEvent.retryCount = 0;
         wasSuccessful = true;
     } catch (error) {
@@ -2517,7 +2653,7 @@ async function flushQueuedFileEvent(runtime: IJobRuntime, absolutePath: string):
 
         latestQueuedEvent.isProcessing = false;
 
-        if (latestQueuedEvent.debounceTimer) {
+        if (latestQueuedEvent.debounceTimer || shouldRetainQueuedEvent) {
             void persistQueuedFileEvents(runtime);
             return;
         }
@@ -2551,6 +2687,50 @@ async function flushQueuedFileEvent(runtime: IJobRuntime, absolutePath: string):
 }
 
 /**
+ * Schedules the next flush for a queued file event, replacing any previous timer.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute file path whose queued event should be flushed.
+ * @param queuedEvent Mutable queued event record to update.
+ * @param delayMs Delay before the queued event is flushed.
+ */
+function scheduleQueuedFileEventFlush(runtime: IJobRuntime, absolutePath: string, queuedEvent: IQueuedFileEvent, delayMs: number): void {
+    if (queuedEvent.debounceTimer) {
+        clearTimeout(queuedEvent.debounceTimer);
+    }
+
+    queuedEvent.debounceTimer = setTimeout(() => {
+        queuedEvent.debounceTimer = undefined;
+        void flushQueuedFileEvent(runtime, absolutePath);
+    }, delayMs);
+}
+
+/**
+ * Delays a queued unlink once more so transient source-side removals do not immediately delete mirrored files.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute source path currently being processed.
+ * @param queuedEvent Mutable queued event record for the path.
+ */
+async function shouldDelayQueuedUnlinkEvent(runtime: IJobRuntime, absolutePath: string, queuedEvent: IQueuedFileEvent): Promise<boolean> {
+    if (await fs.pathExists(absolutePath)) {
+        queuedEvent.missingSinceAtMs = undefined;
+        return false;
+    }
+
+    const missingSinceAtMs = queuedEvent.missingSinceAtMs ?? Date.now();
+    queuedEvent.missingSinceAtMs = missingSinceAtMs;
+    const elapsedMs = Date.now() - missingSinceAtMs;
+
+    if (elapsedMs >= runtime.fileEventDebounceMs) {
+        return false;
+    }
+
+    scheduleQueuedFileEventFlush(runtime, absolutePath, queuedEvent, runtime.fileEventDebounceMs - elapsedMs);
+    return true;
+}
+
+/**
  * Handles file-level watcher events and propagates the corresponding sync or deletion to all destinations.
  *
  * @param runtime Runtime state for the current job.
@@ -2577,6 +2757,21 @@ async function handleFileEvent(runtime: IJobRuntime, filePath: string, eventName
     }
 
     if (eventName === "unlink") {
+        const sourceEntryType = await readMirrorableSourceEntryType(runtime, absolutePath);
+        if (sourceEntryType === "directory") {
+            await syncDirectory(runtime, absolutePath);
+            return;
+        }
+
+        if (sourceEntryType === "file") {
+            await syncFile(runtime, absolutePath);
+            return;
+        }
+
+        if (!shouldMirrorSourcePath(runtime, absolutePath, false)) {
+            return;
+        }
+
         if (runtime.config.deleteMissing) {
             await deleteFileFromDestinations(runtime, absolutePath);
         }
@@ -2594,6 +2789,105 @@ async function handleFileEvent(runtime: IJobRuntime, filePath: string, eventName
 }
 
 /**
+ * Queues a directory delete so transient source-side directory replacements do not immediately delete mirrored folders.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute source directory path whose delete should be confirmed.
+ * @param fullSyncDebounceMs Optional debounce used to schedule a reconciliation once the delete is confirmed.
+ * @param fullSyncReason Optional reason logged when the confirmed delete triggers a reconciliation.
+ */
+function queueDirectoryDelete(runtime: IJobRuntime, absolutePath: string, fullSyncDebounceMs?: number, fullSyncReason?: string): void {
+    const queuedDelete = runtime.queuedDirectoryDeletes.get(absolutePath) ?? {};
+    queuedDelete.fullSyncDebounceMs = fullSyncDebounceMs;
+    queuedDelete.fullSyncReason = fullSyncReason;
+
+    runtime.queuedDirectoryDeletes.set(absolutePath, queuedDelete);
+    scheduleQueuedDirectoryDelete(runtime, absolutePath, queuedDelete, runtime.fileEventDebounceMs);
+}
+
+/**
+ * Cancels any queued delete for a directory path now known to exist again.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute source directory path whose queued delete should be cleared.
+ */
+function cancelQueuedDirectoryDelete(runtime: IJobRuntime, absolutePath: string): void {
+    const queuedDelete = runtime.queuedDirectoryDeletes.get(absolutePath);
+
+    if (!queuedDelete) {
+        return;
+    }
+
+    if (queuedDelete.debounceTimer) {
+        clearTimeout(queuedDelete.debounceTimer);
+    }
+
+    runtime.queuedDirectoryDeletes.delete(absolutePath);
+}
+
+/**
+ * Schedules the next confirmation check for a queued directory delete.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute source directory path being tracked.
+ * @param queuedDelete Mutable queued delete record to update.
+ * @param delayMs Delay before the queued delete is checked again.
+ */
+function scheduleQueuedDirectoryDelete(runtime: IJobRuntime, absolutePath: string, queuedDelete: IQueuedDirectoryDelete, delayMs: number): void {
+    if (queuedDelete.debounceTimer) {
+        clearTimeout(queuedDelete.debounceTimer);
+    }
+
+    queuedDelete.debounceTimer = setTimeout(() => {
+        queuedDelete.debounceTimer = undefined;
+        void flushQueuedDirectoryDelete(runtime, absolutePath);
+    }, delayMs);
+}
+
+/**
+ * Confirms that a source directory is still missing before deleting the mirrored destination folder.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute source directory path whose delete is being confirmed.
+ */
+async function flushQueuedDirectoryDelete(runtime: IJobRuntime, absolutePath: string): Promise<void> {
+    const queuedDelete = runtime.queuedDirectoryDeletes.get(absolutePath);
+
+    if (!queuedDelete) {
+        return;
+    }
+
+    try {
+        const sourceStats = await readExistingPathStats(absolutePath);
+        if (sourceStats?.isDirectory()) {
+            runtime.queuedDirectoryDeletes.delete(absolutePath);
+            return;
+        }
+
+        const missingSinceAtMs = queuedDelete.missingSinceAtMs ?? Date.now();
+        queuedDelete.missingSinceAtMs = missingSinceAtMs;
+        const elapsedMs = Date.now() - missingSinceAtMs;
+
+        if (elapsedMs < runtime.fileEventDebounceMs) {
+            scheduleQueuedDirectoryDelete(runtime, absolutePath, queuedDelete, runtime.fileEventDebounceMs - elapsedMs);
+            return;
+        }
+
+        runtime.queuedDirectoryDeletes.delete(absolutePath);
+        if (runtime.config.deleteMissing) {
+            await deleteDirectoryFromDestinations(runtime, absolutePath);
+        }
+
+        if (queuedDelete.fullSyncDebounceMs !== undefined && queuedDelete.fullSyncReason) {
+            queueRuntimeFullSync(runtime, queuedDelete.fullSyncDebounceMs, queuedDelete.fullSyncReason);
+        }
+    } catch (error) {
+        await appendOperationalErrorLog(runtime, "directory unlinkDir", absolutePath, error);
+        log(`unlinkDir failed for ${absolutePath}: ${formatError(error)}`);
+    }
+}
+
+/**
  * Handles directory-level watcher events and removes mirrored directories when configured to do so.
  *
  * @param runtime Runtime state for the current job.
@@ -2608,6 +2902,8 @@ async function handleDirectoryEvent(runtime: IJobRuntime, dirPath: string, event
         return;
     }
 
+    const sourcePathForLog = formatSourcePathForLog(runtime, absolutePath);
+
     if (path.basename(absolutePath) === IGNORE_FILE_NAME || isOperationalPath(runtime.config.source, absolutePath)) {
         return;
     }
@@ -2616,18 +2912,19 @@ async function handleDirectoryEvent(runtime: IJobRuntime, dirPath: string, event
         return;
     }
 
+    if (isIgnored(runtime, absolutePath, true)) {
+        return;
+    }
+
     try {
         if (eventName === "addDir") {
-            await syncDirectory(runtime, absolutePath);
+            cancelQueuedDirectoryDelete(runtime, absolutePath);
+            log(`Structural change detected (${eventName}) at ${sourcePathForLog}. Syncing subtree incrementally.`);
+            await syncSourceSubtree(runtime, absolutePath);
+            return;
         }
 
-        if (eventName === "unlinkDir" && runtime.config.deleteMissing) {
-            await deleteDirectoryFromDestinations(runtime, absolutePath);
-        }
-
-        if (fullSyncDebounceMs !== undefined) {
-            queueRuntimeFullSync(runtime, fullSyncDebounceMs, `Structural change detected (${eventName}).`);
-        }
+        queueDirectoryDelete(runtime, absolutePath, fullSyncDebounceMs, `Structural change detected (${eventName}) at ${sourcePathForLog}.`);
     } catch (error) {
         await appendOperationalErrorLog(runtime, `directory ${eventName}`, absolutePath, error);
         log(`${eventName} failed for ${absolutePath}: ${formatError(error)}`);
@@ -2696,16 +2993,59 @@ async function syncFile(runtime: IJobRuntime, absoluteFilePath: string, sourceFi
         }
 
         await ensureDestinationParentDirectories(destination, relativePath);
-        await fs.copy(absoluteFilePath, destinationPath, {
-            overwrite: true,
-            preserveTimestamps: true,
-            errorOnExist: false
-        });
+        await copyFileIntoDestinationWithoutDeletingExistingEntry(absoluteFilePath, destinationPath, destinationStats);
         copiedDestinationCount += 1;
     }
 
     if (shouldLogSyncOperation && copiedDestinationCount > 0) {
         logDedupedOperation(runtime, `Synced ${relativePath}`);
+    }
+}
+
+/**
+ * Copies a mirrored file into a destination path without unlinking an existing regular file first.
+ *
+ * @param absoluteFilePath Absolute source file path to mirror.
+ * @param destinationPath Absolute destination file path to update.
+ * @param destinationStats Current destination stats when the path already exists.
+ */
+async function copyFileIntoDestinationWithoutDeletingExistingEntry(absoluteFilePath: string, destinationPath: string, destinationStats?: Stats): Promise<void> {
+    const sourceLinkStats = await fs.lstat(absoluteFilePath);
+
+    if (sourceLinkStats.isSymbolicLink()) {
+        await fs.copy(absoluteFilePath, destinationPath, {
+            overwrite: true,
+            preserveTimestamps: true,
+            errorOnExist: false
+        });
+        return;
+    }
+
+    if (destinationStats?.isFile() && (destinationStats.mode & 0o200) === 0) {
+        await fs.chmod(destinationPath, destinationStats.mode | 0o200);
+    }
+
+    await fs.copyFile(absoluteFilePath, destinationPath);
+    await fs.chmod(destinationPath, sourceLinkStats.mode | 0o200);
+    const updatedSourceStats = await fs.stat(absoluteFilePath);
+    await setFileTimesWithMillisecondPrecision(destinationPath, updatedSourceStats.atime, updatedSourceStats.mtime);
+    await fs.chmod(destinationPath, sourceLinkStats.mode);
+}
+
+/**
+ * Updates file timestamps using a writable file handle so millisecond precision is preserved.
+ *
+ * @param absoluteFilePath Absolute file path whose timestamps should be updated.
+ * @param atime Access time to apply.
+ * @param mtime Modification time to apply.
+ */
+async function setFileTimesWithMillisecondPrecision(absoluteFilePath: string, atime: Date, mtime: Date): Promise<void> {
+    const fileHandle = await open(absoluteFilePath, "r+");
+
+    try {
+        await fileHandle.utimes(atime, mtime);
+    } finally {
+        await fileHandle.close();
     }
 }
 
@@ -3272,36 +3612,112 @@ function registerFileEventBurst(runtime: IJobRuntime, fullSyncDebounceMs?: numbe
 }
 
 /**
+ * Merges two queued full sync requests so follow-up runs preserve the strongest recovery flags.
+ *
+ * @param existingRequest Request that is already queued, if any.
+ * @param nextRequest New request that should be merged into the queue.
+ */
+function mergeQueuedFullSyncRequest(existingRequest: IQueuedFullSyncRequest | undefined, nextRequest: IQueuedFullSyncRequest): IQueuedFullSyncRequest {
+    if (!existingRequest) {
+        return nextRequest;
+    }
+
+    return {
+        debounceMs: Math.min(existingRequest.debounceMs, nextRequest.debounceMs),
+        reason: nextRequest.reason,
+        shouldReloadIgnoreFiles: existingRequest.shouldReloadIgnoreFiles || nextRequest.shouldReloadIgnoreFiles,
+        shouldRefreshWatcher: existingRequest.shouldRefreshWatcher || nextRequest.shouldRefreshWatcher
+    };
+}
+
+/**
+ * Schedules the currently queued full sync request after its debounce delay.
+ *
+ * @param runtime Runtime state for the current job.
+ */
+function scheduleQueuedFullSync(runtime: IJobRuntime): void {
+    const queuedRequest = runtime.queuedFullSyncRequest;
+    if (!queuedRequest) {
+        return;
+    }
+
+    if (runtime.fullSyncTimer) {
+        clearTimeout(runtime.fullSyncTimer);
+    }
+
+    runtime.fullSyncTimer = setTimeout(() => {
+        runtime.fullSyncTimer = undefined;
+        void flushQueuedFullSync(runtime);
+    }, queuedRequest.debounceMs);
+}
+
+/**
+ * Runs the next queued full sync request once the debounce window has elapsed.
+ *
+ * @param runtime Runtime state for the current job.
+ */
+async function flushQueuedFullSync(runtime: IJobRuntime): Promise<void> {
+    if (runtime.isFullSyncRunning) {
+        return;
+    }
+
+    const queuedRequest = runtime.queuedFullSyncRequest;
+    if (!queuedRequest) {
+        return;
+    }
+
+    runtime.queuedFullSyncRequest = undefined;
+    runtime.isFullSyncRunning = true;
+    let startedFullSync = false;
+
+    try {
+        if (queuedRequest.shouldReloadIgnoreFiles) {
+            await reloadIgnoreFiles(runtime);
+        }
+
+        if (queuedRequest.shouldRefreshWatcher) {
+            await restartWatcher(runtime, queuedRequest.debounceMs);
+        }
+
+        log(`${queuedRequest.reason} Running reconciliation.`);
+        startedFullSync = true;
+        await runFullSync(runtime, "Full sync");
+    } catch (error) {
+        if (!startedFullSync) {
+            await appendOperationalErrorLog(runtime, "full sync", runtime.config.source, error);
+        }
+        log(`Full sync failed: ${formatError(error)}`);
+    } finally {
+        runtime.isFullSyncRunning = false;
+
+        if (runtime.queuedFullSyncRequest) {
+            scheduleQueuedFullSync(runtime);
+        }
+    }
+}
+
+/**
  * Debounces a full reconciliation for scenarios where incremental events are not reliable enough to represent the final tree state.
  *
  * @param runtime Runtime state for the current job.
  * @param debounceMs Delay used to debounce the reconciliation.
  * @param reason Human-readable reason for logging.
  * @param shouldReloadIgnoreFiles Whether ignore files should be reloaded before reconciling.
+ * @param shouldRefreshWatcher Whether the Watchman subscription should be refreshed before reconciling.
  */
-function queueRuntimeFullSync(runtime: IJobRuntime, debounceMs: number, reason: string, shouldReloadIgnoreFiles = false): void {
-    if (runtime.fullSyncTimer) {
-        clearTimeout(runtime.fullSyncTimer);
+function queueRuntimeFullSync(runtime: IJobRuntime, debounceMs: number, reason: string, shouldReloadIgnoreFiles = false, shouldRefreshWatcher = false): void {
+    runtime.queuedFullSyncRequest = mergeQueuedFullSyncRequest(runtime.queuedFullSyncRequest, {
+        debounceMs,
+        reason,
+        shouldReloadIgnoreFiles,
+        shouldRefreshWatcher
+    });
+
+    if (runtime.isFullSyncRunning) {
+        return;
     }
 
-    runtime.fullSyncTimer = setTimeout(async () => {
-        let startedFullSync = false;
-
-        try {
-            if (shouldReloadIgnoreFiles) {
-                await reloadIgnoreFiles(runtime);
-            }
-
-            log(`${reason} Running reconciliation.`);
-            startedFullSync = true;
-            await runFullSync(runtime, "Full sync");
-        } catch (error) {
-            if (!startedFullSync) {
-                await appendOperationalErrorLog(runtime, "full sync", runtime.config.source, error);
-            }
-            log(`Full sync failed: ${formatError(error)}`);
-        }
-    }, debounceMs);
+    scheduleQueuedFullSync(runtime);
 }
 
 /**
@@ -3329,6 +3745,18 @@ function formatBytes(sizeBytes: number): string {
     }
 
     return `${value.toFixed(2)} ${units[unitIndex]}`;
+}
+
+/**
+ * Formats a source path relative to the runtime root so logs stay compact but still identify the exact entry.
+ *
+ * @param runtime Runtime state for the current job.
+ * @param absolutePath Absolute source path to describe.
+ */
+function formatSourcePathForLog(runtime: IJobRuntime, absolutePath: string): string {
+    const relativePath = getRelativePathFromSource(runtime.config.source, absolutePath);
+
+    return relativePath.length > 0 ? relativePath : ".";
 }
 
 /**
@@ -3501,4 +3929,4 @@ if (isDirectExecution) {
     });
 }
 
-export { analyzeRuntime, appendOperationalErrorLog, buildWatchmanSubscribeCommand, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, flushQueuedFileEvent, getConfigPath, getRetryDelayMs, handleDirectoryEvent, handleFileEvent, installGlobalCli, isHiddenPath, isIgnored, isPathInsideSource, isWatcherLimitError, main, normalizeWatchmanEntryType, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, readErrorCode, reconcileRuntimes, reloadIgnoreFiles, renderInstallConfigContent, renderLaunchAgentTemplate, resolveConfiguredPath, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, startWatcher, syncFile };
+export { analyzeRuntime, appendOperationalErrorLog, buildWatchmanDirectoryExclusionExpression, buildWatchmanSubscribeCommand, collectWatchmanExcludedDirectories, createInstalledLauncherContent, createInstallPaths, createPathExportBlock, createRuntime, createSourceFolderSlug, flushQueuedFileEvent, getConfigPath, getRetryDelayMs, handleDirectoryEvent, handleFileEvent, handleWatchmanFileNotification, installGlobalCli, isHiddenPath, isIgnored, isPathInsideSource, isWatcherLimitError, main, normalizeWatchmanEntryType, parseCliArguments, parseSetupArguments, queueFileEvent, readConfig, readErrorCode, reconcileRuntimes, reloadIgnoreFiles, renderInstallConfigContent, renderLaunchAgentTemplate, resolveConfiguredPath, restartWatcher, runFullSync, runInitialSync, setupMirror, shouldLogWatcherError, startWatcher, syncFile };

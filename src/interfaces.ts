@@ -33,9 +33,24 @@ export interface IQueuedFileEvent {
     eventName: FileEventName;
     debounceTimer?: NodeJS.Timeout;
     retryTimer?: NodeJS.Timeout;
+    missingSinceAtMs?: number;
     isProcessing: boolean;
     runAfterCurrent: boolean;
     retryCount: number;
+}
+
+export interface IQueuedDirectoryDelete {
+    debounceTimer?: NodeJS.Timeout;
+    missingSinceAtMs?: number;
+    fullSyncDebounceMs?: number;
+    fullSyncReason?: string;
+}
+
+export interface IQueuedFullSyncRequest {
+    debounceMs: number;
+    reason: string;
+    shouldReloadIgnoreFiles: boolean;
+    shouldRefreshWatcher: boolean;
 }
 
 export interface IPersistedQueueItem {
@@ -57,11 +72,14 @@ export interface IJobRuntime {
     queueFilePath: string;
     fileEventDebounceMs: number;
     queuedFileEvents: Map<string, IQueuedFileEvent>;
+    queuedDirectoryDeletes: Map<string, IQueuedDirectoryDelete>;
     recoveredQueuePaths: string[];
     queuePersistencePromise: Promise<void>;
     fileEventBurstCount: number;
     watcherErrorState?: IWatcherErrorState;
     watcher?: IWatchSession;
+    queuedFullSyncRequest?: IQueuedFullSyncRequest;
+    isFullSyncRunning?: boolean;
     fullSyncTimer?: NodeJS.Timeout;
     fileEventBurstTimer?: NodeJS.Timeout;
 }
